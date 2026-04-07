@@ -1,16 +1,14 @@
 """
 fpga_plot.py
 
-Real-time plotting widget for FPGA sensor/feedback signals.
-Provides two views — identical to the LabVIEW "Bead" (time domain) and
-"Plot 0" (frequency domain / PSD) tabs:
+Real-time diagnostic plot windows for FPGA feedback signals.
 
-  * **Time trace**  — scrolling strip-chart of selected indicator channels.
-  * **PSD**         — live power spectral density computed from the most
-                      recent history window, displayed on a log-log scale.
+Three independent top-level windows (X, Y, Z) show scrolling time-domain
+traces of the last 5 seconds.  PSD is computed on demand via a button
+(not live-updated).
 
-Can be embedded as a tab in fpga_gui or run standalone:
-    python fpga_plot.py
+Drawing is decoupled from data arrival: data is buffered on push and
+a QTimer redraws at ~30 fps using line.set_data() for efficiency.
 """
 
 from __future__ import annotations
@@ -18,223 +16,96 @@ from __future__ import annotations
 import collections
 import time
 
-from PyQt5.QtCore import Qt
+import numpy as np
+from PyQt5.QtCore import Qt, QTimer
 from PyQt5.QtWidgets import (
     QCheckBox,
     QComboBox,
-    QGridLayout,
-    QGroupBox,
+    QDialog,
     QHBoxLayout,
     QLabel,
     QMainWindow,
-    QSpinBox,
-    QTabWidget,
+    QPushButton,
     QVBoxLayout,
     QWidget,
 )
-
-import numpy as np
-from matplotlib.backends.backend_qt5agg import (
-    FigureCanvasQTAgg as FigureCanvas,
-    NavigationToolbar2QT as NavigationToolbar,
-)
+from matplotlib.backends.backend_qt5agg import FigureCanvasQTAgg as FigureCanvas
 from matplotlib.figure import Figure
 
 
-# Indicators worth plotting — sensor readings and feedback outputs
-PLOT_CHANNELS: list[dict] = [
-    {"name": "AI Z plot",              "label": "Z sensor",           "color": "#1f77b4"},
-    {"name": "AI Z before chamber plot", "label": "Z before chamber", "color": "#aec7e8"},
-    {"name": "fb Z plot",              "label": "Z feedback",         "color": "#ff7f0e"},
-    {"name": "fb Z before chamber plot", "label": "Z fb before",     "color": "#ffbb78"},
-    {"name": "tot_fb Z plot",          "label": "Z total feedback",   "color": "#e6550d"},
-    {"name": "AI Y plot",              "label": "Y sensor",           "color": "#2ca02c"},
-    {"name": "AI Y before chamber plot", "label": "Y before chamber", "color": "#98df8a"},
-    {"name": "fb Y plot",              "label": "Y feedback",         "color": "#d62728"},
-    {"name": "fb Y before chamber plot", "label": "Y fb before",     "color": "#ff9896"},
-    {"name": "tot_fb Y plot",          "label": "Y total feedback",   "color": "#a63603"},
-    {"name": "AI X plot",              "label": "X sensor",           "color": "#9467bd"},
-    {"name": "AI X before chamber plot", "label": "X before chamber", "color": "#c5b0d5"},
-    {"name": "fb X plot",              "label": "X feedback",         "color": "#8c564b"},
-    {"name": "fb X before chamber plot", "label": "X fb before",     "color": "#c49c94"},
-    {"name": "tot_fb X plot",          "label": "X total feedback",   "color": "#7b4173"},
-    {"name": "accum out z1",           "label": "Accum Z1",           "color": "#17becf"},
-    {"name": "accum out z2",           "label": "Accum Z2",           "color": "#bcbd22"},
-]
+# ── Channel definitions per axis ─────────────────────────────────────────
+
+AXIS_CHANNELS: dict[str, list[dict]] = {
+    "X": [
+        {"name": "AI X plot",               "label": "AI X",        "color": "#9467bd"},
+        {"name": "AI X before chamber plot", "label": "AI X before", "color": "#c5b0d5"},
+        {"name": "fb X plot",               "label": "fb X",        "color": "#8c564b"},
+        {"name": "fb X before chamber plot", "label": "fb X before", "color": "#c49c94"},
+        {"name": "tot_fb X plot",           "label": "tot fb X",    "color": "#7b4173"},
+    ],
+    "Y": [
+        {"name": "AI Y plot",               "label": "AI Y",        "color": "#2ca02c"},
+        {"name": "AI Y before chamber plot", "label": "AI Y before", "color": "#98df8a"},
+        {"name": "fb Y plot",               "label": "fb Y",        "color": "#d62728"},
+        {"name": "fb Y before chamber plot", "label": "fb Y before", "color": "#ff9896"},
+        {"name": "tot_fb Y plot",           "label": "tot fb Y",    "color": "#a63603"},
+    ],
+    "Z": [
+        {"name": "AI Z plot",               "label": "AI Z",        "color": "#1f77b4"},
+        {"name": "AI Z before chamber plot", "label": "AI Z before", "color": "#aec7e8"},
+        {"name": "fb Z plot",               "label": "fb Z",        "color": "#ff7f0e"},
+        {"name": "fb Z before chamber plot", "label": "fb Z before", "color": "#ffbb78"},
+        {"name": "tot_fb Z plot",           "label": "tot fb Z",    "color": "#e6550d"},
+        {"name": "accum out z1",            "label": "Accum Z1",    "color": "#17becf"},
+        {"name": "accum out z2",            "label": "Accum Z2",    "color": "#bcbd22"},
+    ],
+}
+
+# Flat list of every plot register name (exported for fpga_core fast reads)
+ALL_PLOT_NAMES: list[str] = []
+for _chs in AXIS_CHANNELS.values():
+    for _ch in _chs:
+        if _ch["name"] not in ALL_PLOT_NAMES:
+            ALL_PLOT_NAMES.append(_ch["name"])
 
 
-class FPGAPlotWidget(QWidget):
-    """Real-time time-domain + PSD widget for FPGA indicators."""
+# ── PSD dialog (on-demand, not live) ─────────────────────────────────────
 
-    def __init__(self, parent=None, max_points: int = 500,
-                 sample_rate: float = 5.0):
-        """
-        Parameters
-        ----------
-        max_points  : ring-buffer length (number of poll samples stored)
-        sample_rate : approximate samples per second (= 1000 / poll_interval_ms).
-                      Used only for the PSD frequency axis.
-        """
+class PSDDialog(QDialog):
+    """One-shot PSD computed from a snapshot of the current ring buffer."""
+
+    def __init__(self, axis: str, times: list[float],
+                 data: dict[str, list[float]],
+                 channels: list[dict], parent=None):
         super().__init__(parent)
-        self._max_points = max_points
-        self._sample_rate = sample_rate
-        self._t0 = time.monotonic()
+        self.setWindowTitle(f"PSD — {axis}")
+        self.resize(750, 420)
+        self.setAttribute(Qt.WA_DeleteOnClose)
 
-        # Ring buffers: {channel_name: deque of (t, value)}
-        self._buffers: dict[str, collections.deque] = {
-            ch["name"]: collections.deque(maxlen=max_points)
-            for ch in PLOT_CHANNELS
-        }
-        self._checkboxes: dict[str, QCheckBox] = {}
-        self._build_ui()
+        self._times = np.asarray(times)
+        self._data = {k: np.asarray(v) for k, v in data.items()}
+        self._channels = channels
 
-    # ------------------------------------------------------------------
-    # UI
-    # ------------------------------------------------------------------
+        layout = QVBoxLayout(self)
 
-    def _build_ui(self) -> None:
-        layout = QHBoxLayout(self)
+        top = QHBoxLayout()
+        top.addWidget(QLabel("Window:"))
+        self._win_combo = QComboBox()
+        self._win_combo.addItems(["hanning", "hamming", "blackman", "boxcar"])
+        self._win_combo.currentIndexChanged.connect(self._recompute)
+        top.addWidget(self._win_combo)
+        top.addStretch()
+        layout.addLayout(top)
 
-        # --- Left: channel checkboxes + settings ---
-        left = QVBoxLayout()
-        grp = QGroupBox("Channels")
-        grid = QGridLayout()
-        for i, ch in enumerate(PLOT_CHANNELS):
-            cb = QCheckBox(ch["label"])
-            cb.setChecked(i < 3)  # default: first 3 checked
-            cb.stateChanged.connect(self._replot)
-            self._checkboxes[ch["name"]] = cb
-            grid.addWidget(cb, i, 0)
-        grp.setLayout(grid)
-        left.addWidget(grp)
+        self._fig = Figure(figsize=(7, 3.5), tight_layout=True)
+        self._ax = self._fig.add_subplot(111)
+        self._canvas = FigureCanvas(self._fig)
+        layout.addWidget(self._canvas)
 
-        # History length
-        hist_row = QHBoxLayout()
-        hist_row.addWidget(QLabel("History:"))
-        self._hist_spin = QSpinBox()
-        self._hist_spin.setRange(50, 10000)
-        self._hist_spin.setValue(self._max_points)
-        self._hist_spin.setSuffix(" pts")
-        self._hist_spin.valueChanged.connect(self._resize_buffers)
-        hist_row.addWidget(self._hist_spin)
-        left.addLayout(hist_row)
+        self._recompute()
 
-        # PSD window type
-        win_row = QHBoxLayout()
-        win_row.addWidget(QLabel("Window:"))
-        self._window_combo = QComboBox()
-        self._window_combo.addItems(["hanning", "hamming", "blackman", "boxcar"])
-        self._window_combo.currentIndexChanged.connect(self._replot)
-        win_row.addWidget(self._window_combo)
-        left.addLayout(win_row)
-
-        left.addStretch()
-        layout.addLayout(left, 1)
-
-        # --- Right: tabbed plots ---
-        self._tabs = QTabWidget()
-
-        # Time domain tab
-        time_widget = QWidget()
-        time_layout = QVBoxLayout(time_widget)
-        self._time_fig = Figure(figsize=(8, 4), tight_layout=True)
-        self._time_ax = self._time_fig.add_subplot(111)
-        self._time_ax.set_xlabel("Time (s)")
-        self._time_ax.set_ylabel("Value")
-        self._time_ax.grid(True, alpha=0.3)
-        self._time_canvas = FigureCanvas(self._time_fig)
-        self._time_toolbar = NavigationToolbar(self._time_canvas, self)
-        time_layout.addWidget(self._time_toolbar)
-        time_layout.addWidget(self._time_canvas)
-        self._tabs.addTab(time_widget, "Bead")
-
-        # PSD tab
-        psd_widget = QWidget()
-        psd_layout = QVBoxLayout(psd_widget)
-        self._psd_fig = Figure(figsize=(8, 4), tight_layout=True)
-        self._psd_ax = self._psd_fig.add_subplot(111)
-        self._psd_ax.set_xlabel("Frequency (Hz)")
-        self._psd_ax.set_ylabel("PSD")
-        self._psd_ax.set_xscale("log")
-        self._psd_ax.set_yscale("log")
-        self._psd_ax.grid(True, alpha=0.3, which="both")
-        self._psd_canvas = FigureCanvas(self._psd_fig)
-        self._psd_toolbar = NavigationToolbar(self._psd_canvas, self)
-        psd_layout.addWidget(self._psd_toolbar)
-        psd_layout.addWidget(self._psd_canvas)
-        self._tabs.addTab(psd_widget, "Plot 0")
-
-        right = QVBoxLayout()
-        right.addWidget(self._tabs)
-        layout.addLayout(right, 4)
-
-    # ------------------------------------------------------------------
-    # Public API — called by the GUI on each monitor poll
-    # ------------------------------------------------------------------
-
-    def push_values(self, values: dict[str, float]) -> None:
-        """Append a new sample for each tracked channel and redraw."""
-        t = time.monotonic() - self._t0
-        for ch in PLOT_CHANNELS:
-            name = ch["name"]
-            if name in values:
-                self._buffers[name].append((t, values[name]))
-        self._replot()
-
-    def clear(self) -> None:
-        """Clear all history buffers."""
-        for buf in self._buffers.values():
-            buf.clear()
-        self._t0 = time.monotonic()
-        self._replot()
-
-    def set_sample_rate(self, rate: float) -> None:
-        """Update the assumed sample rate (for PSD freq axis)."""
-        self._sample_rate = rate
-
-    # ------------------------------------------------------------------
-    # Internal
-    # ------------------------------------------------------------------
-
-    def _resize_buffers(self, new_max: int) -> None:
-        self._max_points = new_max
-        for name in list(self._buffers):
-            old = self._buffers[name]
-            new_buf: collections.deque = collections.deque(old, maxlen=new_max)
-            self._buffers[name] = new_buf
-
-    def _active_channels(self) -> list[dict]:
-        """Return channels whose checkbox is checked and have data."""
-        active = []
-        for ch in PLOT_CHANNELS:
-            cb = self._checkboxes.get(ch["name"])
-            if cb is not None and cb.isChecked() and len(self._buffers[ch["name"]]) >= 2:
-                active.append(ch)
-        return active
-
-    def _replot(self, *_args) -> None:
-        self._replot_time()
-        self._replot_psd()
-
-    def _replot_time(self) -> None:
-        ax = self._time_ax
-        ax.clear()
-        ax.set_xlabel("Time (s)")
-        ax.set_ylabel("Value")
-        ax.grid(True, alpha=0.3)
-
-        for ch in self._active_channels():
-            buf = self._buffers[ch["name"]]
-            ts = np.array([p[0] for p in buf])
-            vs = np.array([p[1] for p in buf])
-            ax.plot(ts, vs, label=ch["label"], color=ch["color"], linewidth=1)
-
-        if self._active_channels():
-            ax.legend(fontsize=7, loc="upper left")
-        self._time_canvas.draw_idle()
-
-    def _replot_psd(self) -> None:
-        ax = self._psd_ax
+    def _recompute(self) -> None:
+        ax = self._ax
         ax.clear()
         ax.set_xlabel("Frequency (Hz)")
         ax.set_ylabel("PSD")
@@ -242,68 +113,246 @@ class FPGAPlotWidget(QWidget):
         ax.set_yscale("log")
         ax.grid(True, alpha=0.3, which="both")
 
-        active = self._active_channels()
-        if not active:
-            self._psd_canvas.draw_idle()
+        n = len(self._times)
+        if n < 8:
+            self._canvas.draw()
             return
 
-        # Determine effective sample rate from timestamps
-        for ch in active:
-            buf = self._buffers[ch["name"]]
-            if len(buf) < 8:
+        dt = (self._times[-1] - self._times[0]) / (n - 1)
+        fs = 1.0 / dt if dt > 0 else 100.0
+
+        win_name = self._win_combo.currentText()
+        win_fn = {"hanning": np.hanning, "hamming": np.hamming,
+                  "blackman": np.blackman}.get(win_name)
+        win = win_fn(n) if win_fn else np.ones(n)
+        win_norm = np.sum(win ** 2)
+        if win_norm == 0:
+            self._canvas.draw()
+            return
+
+        for ch in self._channels:
+            vs = self._data.get(ch["name"])
+            if vs is None or len(vs) != n:
                 continue
-            vs = np.array([p[1] for p in buf])
-            ts = np.array([p[0] for p in buf])
-            n = len(vs)
-
-            # Estimate sample rate from actual timestamps
-            dt = (ts[-1] - ts[0]) / (n - 1) if n > 1 else 1.0 / self._sample_rate
-            fs = 1.0 / dt if dt > 0 else self._sample_rate
-
-            # Apply window
-            win_name = self._window_combo.currentText()
-            if win_name == "hanning":
-                win = np.hanning(n)
-            elif win_name == "hamming":
-                win = np.hamming(n)
-            elif win_name == "blackman":
-                win = np.blackman(n)
-            else:
-                win = np.ones(n)
-
-            # Avoid divide-by-zero
-            win_norm = np.sum(win ** 2)
-            if win_norm == 0:
-                continue
-
-            # Compute one-sided PSD via FFT
             windowed = (vs - np.mean(vs)) * win
             fft_vals = np.fft.rfft(windowed)
             psd = (2.0 / (fs * win_norm)) * np.abs(fft_vals) ** 2
             freqs = np.fft.rfftfreq(n, d=1.0 / fs)
-
-            # Skip DC
             if len(freqs) > 1:
-                ax.plot(freqs[1:], psd[1:],
-                        label=ch["label"], color=ch["color"], linewidth=1)
+                ax.plot(freqs[1:], psd[1:], label=ch["label"],
+                        color=ch["color"], linewidth=1)
 
-        if active:
-            ax.legend(fontsize=7, loc="upper right")
-        self._psd_canvas.draw_idle()
+        ax.legend(fontsize=7, loc="upper right")
+        self._canvas.draw()
 
 
-# ---------------------------------------------------------------------------
-# Standalone mode
-# ---------------------------------------------------------------------------
+# ── Per-axis live plot window ─────────────────────────────────────────────
+
+class LiveAxisWindow(QMainWindow):
+    """Scrolling time-domain strip chart for one feedback axis."""
+
+    def __init__(self, axis: str, history_sec: float = 5.0):
+        super().__init__()  # no parent → independent top-level window
+        self.setWindowTitle(f"{axis} Axis — Live")
+        self.resize(900, 300)
+
+        self._axis = axis
+        self._history_sec = history_sec
+        self._channels = AXIS_CHANNELS[axis]
+        self._t0 = time.monotonic()
+        self._allow_close = False  # True only on app shutdown
+
+        # Ring buffers — generous size for 5 s at up to 1 kHz poll rate
+        self._max_points = 5000
+        self._times: collections.deque[float] = collections.deque(maxlen=self._max_points)
+        self._data: dict[str, collections.deque] = {
+            ch["name"]: collections.deque(maxlen=self._max_points)
+            for ch in self._channels
+        }
+
+        self._build_ui()
+
+        # Timer-driven redraw (~30 fps), starts on first showEvent
+        self._dirty = False
+        self._timer = QTimer(self)
+        self._timer.timeout.connect(self._redraw)
+
+    # ── UI ────────────────────────────────────────────────────────────
+
+    def _build_ui(self) -> None:
+        w = QWidget()
+        self.setCentralWidget(w)
+        layout = QVBoxLayout(w)
+        layout.setContentsMargins(4, 4, 4, 4)
+
+        # Checkboxes + PSD button
+        top = QHBoxLayout()
+        self._cbs: dict[str, QCheckBox] = {}
+        for i, ch in enumerate(self._channels):
+            cb = QCheckBox(ch["label"])
+            cb.setChecked(i < 2)  # first two channels on by default
+            cb.stateChanged.connect(self._on_cb)
+            self._cbs[ch["name"]] = cb
+            top.addWidget(cb)
+        top.addStretch()
+        psd_btn = QPushButton("Compute PSD")
+        psd_btn.clicked.connect(self._show_psd)
+        top.addWidget(psd_btn)
+        layout.addLayout(top)
+
+        # Matplotlib canvas (no toolbar — keep lightweight)
+        self._fig = Figure(figsize=(9, 2.5), tight_layout=True)
+        self._ax = self._fig.add_subplot(111)
+        self._ax.set_xlabel("Time (s)")
+        self._ax.set_ylabel("Value")
+        self._ax.grid(True, alpha=0.3)
+        self._canvas = FigureCanvas(self._fig)
+        layout.addWidget(self._canvas)
+
+        # Pre-create Line2D objects (avoids re-creation on every frame)
+        self._lines: dict[str, object] = {}
+        for ch in self._channels:
+            (line,) = self._ax.plot([], [], label=ch["label"],
+                                    color=ch["color"], linewidth=1)
+            self._lines[ch["name"]] = line
+            if not self._cbs[ch["name"]].isChecked():
+                line.set_visible(False)
+
+        self._ax.legend(fontsize=7, loc="upper left")
+        self._canvas.draw()
+
+    # ── Checkbox toggle ───────────────────────────────────────────────
+
+    def _on_cb(self) -> None:
+        for ch in self._channels:
+            self._lines[ch["name"]].set_visible(
+                self._cbs[ch["name"]].isChecked())
+        self._dirty = True
+
+    # ── Data input (called from PlotManager) ──────────────────────────
+
+    def push_values(self, values: dict[str, float]) -> None:
+        """Buffer a new sample.  No drawing happens here."""
+        t = time.monotonic() - self._t0
+        self._times.append(t)
+        for ch in self._channels:
+            self._data[ch["name"]].append(values.get(ch["name"], 0.0))
+        self._dirty = True
+
+    # ── Timer-driven redraw ───────────────────────────────────────────
+
+    def _redraw(self) -> None:
+        if not self._dirty or not self._times:
+            return
+        self._dirty = False
+
+        t_arr = np.asarray(self._times)
+        t_now = t_arr[-1]
+        t_min = t_now - self._history_sec
+
+        mask = t_arr >= t_min
+        t_vis = t_arr[mask]
+
+        has_data = False
+        for ch in self._channels:
+            line = self._lines[ch["name"]]
+            if not line.get_visible():
+                line.set_data([], [])
+                continue
+            v_arr = np.asarray(self._data[ch["name"]])
+            line.set_data(t_vis, v_arr[mask])
+            has_data = True
+
+        if has_data and len(t_vis):
+            self._ax.set_xlim(t_min, t_now)
+            self._ax.relim()
+            self._ax.autoscale_view(scalex=False, scaley=True)
+
+        self._canvas.draw_idle()
+
+    # ── On-demand PSD ─────────────────────────────────────────────────
+
+    def _show_psd(self) -> None:
+        if len(self._times) < 8:
+            return
+        active = [ch for ch in self._channels
+                  if self._cbs[ch["name"]].isChecked()]
+        if not active:
+            return
+        times = list(self._times)
+        data = {ch["name"]: list(self._data[ch["name"]]) for ch in active}
+        dlg = PSDDialog(self._axis, times, data, active, parent=self)
+        dlg.show()
+
+    # ── Lifecycle ─────────────────────────────────────────────────────
+
+    def clear(self) -> None:
+        self._times.clear()
+        for d in self._data.values():
+            d.clear()
+        self._t0 = time.monotonic()
+        self._dirty = True
+
+    def showEvent(self, event) -> None:
+        if not self._timer.isActive():
+            self._timer.start(33)  # ~30 fps
+        super().showEvent(event)
+
+    def hideEvent(self, event) -> None:
+        self._timer.stop()
+        super().hideEvent(event)
+
+    def closeEvent(self, event) -> None:
+        if self._allow_close:
+            self._timer.stop()
+            event.accept()
+        else:
+            # Just hide — re-show via "Show Plot Windows"
+            event.ignore()
+            self.hide()
+
+
+# ── Plot manager ──────────────────────────────────────────────────────────
+
+class PlotManager:
+    """Creates and manages the three per-axis live plot windows."""
+
+    def __init__(self) -> None:
+        self._windows: dict[str, LiveAxisWindow] = {
+            axis: LiveAxisWindow(axis) for axis in ("X", "Y", "Z")
+        }
+
+    def show(self) -> None:
+        for w in self._windows.values():
+            w.show()
+            w.raise_()
+
+    def hide(self) -> None:
+        for w in self._windows.values():
+            w.hide()
+
+    def push_values(self, values: dict[str, float]) -> None:
+        for w in self._windows.values():
+            w.push_values(values)
+
+    def clear(self) -> None:
+        for w in self._windows.values():
+            w.clear()
+
+    def close(self) -> None:
+        """Permanently close all plot windows (app shutdown)."""
+        for w in self._windows.values():
+            w._allow_close = True
+            w.close()
+
+
+# ── Standalone mode ───────────────────────────────────────────────────────
 
 if __name__ == "__main__":
     import sys
     from PyQt5.QtWidgets import QApplication
 
     app = QApplication(sys.argv)
-    win = QMainWindow()
-    win.setWindowTitle("FPGA Plot — Standalone")
-    win.setCentralWidget(FPGAPlotWidget())
-    win.resize(1000, 500)
-    win.show()
+    mgr = PlotManager()
+    mgr.show()
     sys.exit(app.exec_())

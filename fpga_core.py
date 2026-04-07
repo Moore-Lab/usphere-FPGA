@@ -89,13 +89,15 @@ class FPGAConfig:
         r"\Microspherefeedb_FPGATarget2_Notches_all_channels_20260203_DCM.lvbitx"
     )
     resource: str = "PXI1Slot2"
-    poll_interval_ms: int = 200     # how often the monitor reads indicators
+    poll_interval_ms: int = 200     # how often the monitor reads all registers
+    plot_interval_ms: int = 10      # fast poll rate for plot indicators (ms)
 
     def to_dict(self) -> dict:
         return {
             "bitfile": self.bitfile,
             "resource": self.resource,
             "poll_interval_ms": self.poll_interval_ms,
+            "plot_interval_ms": self.plot_interval_ms,
         }
 
     @classmethod
@@ -129,18 +131,21 @@ class FPGAController:
         config: FPGAConfig | None = None,
         on_status=None,
         on_registers_updated=None,
+        on_plot_data=None,
         on_connected=None,
         on_disconnected=None,
     ):
         self.config = config or FPGAConfig()
         self._on_status = on_status or print
         self._on_registers_updated = on_registers_updated
+        self._on_plot_data = on_plot_data
         self._on_connected = on_connected
         self._on_disconnected = on_disconnected
 
         self._session = None          # nifpga.Session or None
         self._sim_regs: dict[str, float] = dict(DEFAULTS)  # simulation store
         self._connected = False
+        self._plot_names: list[str] = []
         self._monitor_stop = threading.Event()
         self._monitor_thread: threading.Thread | None = None
         self._lock = threading.Lock()
@@ -221,6 +226,11 @@ class FPGAController:
         """Read every register. Returns dict[name, value]."""
         with self._lock:
             return {name: self._read_one(name) for name in ALL_NAMES}
+
+    def read_registers(self, names: list[str]) -> dict[str, float]:
+        """Read a subset of registers by name."""
+        with self._lock:
+            return {name: self._read_one(name) for name in names}
 
     def write_many(self, values: dict[str, float]) -> dict[str, str]:
         """
@@ -429,10 +439,11 @@ class FPGAController:
     # Monitor (periodic polling of read-only indicators)
     # ------------------------------------------------------------------
 
-    def start_monitor(self) -> None:
-        """Begin polling all registers at config.poll_interval_ms."""
+    def start_monitor(self, plot_names: list[str] | None = None) -> None:
+        """Begin polling registers. *plot_names* are read at fast rate."""
         if self._monitor_thread is not None and self._monitor_thread.is_alive():
             return
+        self._plot_names = plot_names or []
         self._monitor_stop.clear()
         self._monitor_thread = threading.Thread(target=self._monitor_loop, daemon=True)
         self._monitor_thread.start()
@@ -474,10 +485,22 @@ class FPGAController:
             self._sim_regs[name] = value
 
     def _monitor_loop(self) -> None:
-        interval = self.config.poll_interval_ms / 1000.0
+        plot_dt = self.config.plot_interval_ms / 1000.0
+        full_dt = self.config.poll_interval_ms / 1000.0
+        full_every = max(1, round(full_dt / plot_dt)) if plot_dt > 0 else 1
+        counter = 0
+
         while not self._monitor_stop.is_set():
             if self._connected:
-                values = self.read_all()
-                if self._on_registers_updated:
-                    self._on_registers_updated(values)
-            self._monitor_stop.wait(interval)
+                # Fast: read only plot indicators
+                if self._on_plot_data and self._plot_names:
+                    self._on_plot_data(self.read_registers(self._plot_names))
+
+                # Slow: periodically read all registers for GUI fields
+                counter += 1
+                if counter >= full_every:
+                    counter = 0
+                    if self._on_registers_updated:
+                        self._on_registers_updated(self.read_all())
+
+            self._monitor_stop.wait(plot_dt)

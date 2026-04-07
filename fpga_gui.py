@@ -52,7 +52,7 @@ from fpga_registers import (
     names_by_category,
     writable_registers,
 )
-from fpga_plot import FPGAPlotWidget
+from fpga_plot import ALL_PLOT_NAMES, PlotManager
 
 
 # ---------------------------------------------------------------------------
@@ -62,6 +62,7 @@ from fpga_plot import FPGAPlotWidget
 class _Signals(QObject):
     status_message = pyqtSignal(str)
     registers_updated = pyqtSignal(dict)
+    plot_data = pyqtSignal(dict)
     connected = pyqtSignal()
     disconnected = pyqtSignal()
 
@@ -114,6 +115,7 @@ class FPGAMainWindow(QMainWindow):
         self._signals = _Signals()
         self._signals.status_message.connect(self._append_status)
         self._signals.registers_updated.connect(self._on_registers_updated)
+        self._signals.plot_data.connect(self._on_plot_data)
         self._signals.connected.connect(self._on_connected)
         self._signals.disconnected.connect(self._on_disconnected)
 
@@ -121,6 +123,7 @@ class FPGAMainWindow(QMainWindow):
         self._ctrl = FPGAController(
             on_status=self._signals.status_message.emit,
             on_registers_updated=self._signals.registers_updated.emit,
+            on_plot_data=self._signals.plot_data.emit,
             on_connected=self._signals.connected.emit,
             on_disconnected=self._signals.disconnected.emit,
         )
@@ -131,6 +134,9 @@ class FPGAMainWindow(QMainWindow):
         self._host_values: dict[str, float] = dict(HOST_PARAM_DEFAULTS)
         self._bead_fb_combos: dict[str, QComboBox] = {}  # per-axis bead fb selector
         self._boost_multiplier: float = 10.0              # boost gain factor
+
+        # Plot windows (separate top-level windows for X, Y, Z)
+        self._plot_manager = PlotManager()
 
         self._build_ui()
         self._restore_session()
@@ -618,8 +624,34 @@ class FPGAMainWindow(QMainWindow):
     # ------------------------------------------------------------------
 
     def _build_plot_tab(self) -> QWidget:
-        self._plot_widget = FPGAPlotWidget()
-        return self._plot_widget
+        widget = QWidget()
+        layout = QVBoxLayout(widget)
+
+        rate_grp = QGroupBox("Plot Update Rate")
+        rl = QHBoxLayout()
+        rl.addWidget(QLabel("Plot poll interval:"))
+        self._plot_poll_spin = QSpinBox()
+        self._plot_poll_spin.setRange(5, 1000)
+        self._plot_poll_spin.setValue(self._ctrl.config.plot_interval_ms)
+        self._plot_poll_spin.setSuffix(" ms")
+        rl.addWidget(self._plot_poll_spin)
+        rl.addStretch()
+        rate_grp.setLayout(rl)
+        layout.addWidget(rate_grp)
+
+        win_grp = QGroupBox("Plot Windows")
+        wl = QVBoxLayout()
+        show_btn = QPushButton("Show Plot Windows")
+        show_btn.clicked.connect(self._plot_manager.show)
+        wl.addWidget(show_btn)
+        clear_btn = QPushButton("Clear All Plots")
+        clear_btn.clicked.connect(self._plot_manager.clear)
+        wl.addWidget(clear_btn)
+        win_grp.setLayout(wl)
+        layout.addWidget(win_grp)
+
+        layout.addStretch()
+        return widget
 
     # ==================================================================
     # Widget-building helpers
@@ -776,7 +808,9 @@ class FPGAMainWindow(QMainWindow):
 
     def _on_registers_updated(self, values: dict) -> None:
         self._update_reg_edits(values)
-        self._plot_widget.push_values(values)
+
+    def _on_plot_data(self, values: dict) -> None:
+        self._plot_manager.push_values(values)
 
     def _update_reg_edits(self, values: dict[str, float]) -> None:
         for name, val in values.items():
@@ -954,7 +988,9 @@ class FPGAMainWindow(QMainWindow):
             self._append_status("Not connected.")
             return
         self._ctrl.config.poll_interval_ms = self._poll_spin.value()
-        self._ctrl.start_monitor()
+        self._ctrl.config.plot_interval_ms = self._plot_poll_spin.value()
+        self._ctrl.start_monitor(plot_names=ALL_PLOT_NAMES)
+        self._plot_manager.show()
 
     def _on_stop_monitor(self) -> None:
         self._ctrl.stop_monitor()
@@ -1005,6 +1041,7 @@ class FPGAMainWindow(QMainWindow):
 
     def closeEvent(self, event) -> None:
         self._ctrl.disconnect()
+        self._plot_manager.close()
         super().closeEvent(event)
 
 
