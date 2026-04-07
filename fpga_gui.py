@@ -52,7 +52,7 @@ from fpga_registers import (
     names_by_category,
     writable_registers,
 )
-from fpga_plot import ALL_PLOT_NAMES, PlotManager
+from fpga_plot import ALL_PLOT_NAMES, FPGAPlotWidget
 
 
 # ---------------------------------------------------------------------------
@@ -134,9 +134,6 @@ class FPGAMainWindow(QMainWindow):
         self._host_values: dict[str, float] = dict(HOST_PARAM_DEFAULTS)
         self._bead_fb_combos: dict[str, QComboBox] = {}  # per-axis bead fb selector
         self._boost_multiplier: float = 10.0              # boost gain factor
-
-        # Plot windows (separate top-level windows for X, Y, Z)
-        self._plot_manager = PlotManager()
 
         self._build_ui()
         self._restore_session()
@@ -626,31 +623,22 @@ class FPGAMainWindow(QMainWindow):
     def _build_plot_tab(self) -> QWidget:
         widget = QWidget()
         layout = QVBoxLayout(widget)
+        layout.setContentsMargins(4, 4, 4, 4)
 
-        rate_grp = QGroupBox("Plot Update Rate")
-        rl = QHBoxLayout()
-        rl.addWidget(QLabel("Plot poll interval:"))
+        # Settings row
+        top = QHBoxLayout()
+        top.addWidget(QLabel("Plot poll interval:"))
         self._plot_poll_spin = QSpinBox()
         self._plot_poll_spin.setRange(5, 1000)
         self._plot_poll_spin.setValue(self._ctrl.config.plot_interval_ms)
         self._plot_poll_spin.setSuffix(" ms")
-        rl.addWidget(self._plot_poll_spin)
-        rl.addStretch()
-        rate_grp.setLayout(rl)
-        layout.addWidget(rate_grp)
+        top.addWidget(self._plot_poll_spin)
+        top.addStretch()
+        layout.addLayout(top)
 
-        win_grp = QGroupBox("Plot Windows")
-        wl = QVBoxLayout()
-        show_btn = QPushButton("Show Plot Windows")
-        show_btn.clicked.connect(self._plot_manager.show)
-        wl.addWidget(show_btn)
-        clear_btn = QPushButton("Clear All Plots")
-        clear_btn.clicked.connect(self._plot_manager.clear)
-        wl.addWidget(clear_btn)
-        win_grp.setLayout(wl)
-        layout.addWidget(win_grp)
-
-        layout.addStretch()
+        # Embedded 3×3 plot grid
+        self._plot_widget = FPGAPlotWidget()
+        layout.addWidget(self._plot_widget, stretch=1)
         return widget
 
     # ==================================================================
@@ -810,7 +798,7 @@ class FPGAMainWindow(QMainWindow):
         self._update_reg_edits(values)
 
     def _on_plot_data(self, values: dict) -> None:
-        self._plot_manager.push_values(values)
+        self._plot_widget.push_values(values)
 
     def _update_reg_edits(self, values: dict[str, float]) -> None:
         for name, val in values.items():
@@ -990,7 +978,6 @@ class FPGAMainWindow(QMainWindow):
         self._ctrl.config.poll_interval_ms = self._poll_spin.value()
         self._ctrl.config.plot_interval_ms = self._plot_poll_spin.value()
         self._ctrl.start_monitor(plot_names=ALL_PLOT_NAMES)
-        self._plot_manager.show()
 
     def _on_stop_monitor(self) -> None:
         self._ctrl.stop_monitor()
@@ -1041,7 +1028,6 @@ class FPGAMainWindow(QMainWindow):
 
     def closeEvent(self, event) -> None:
         self._ctrl.disconnect()
-        self._plot_manager.close()
         super().closeEvent(event)
 
 
