@@ -71,17 +71,56 @@ The target pressure for proceeding to the next stage is **2–3 mbar**.
 
 ## Stage 4: Position the Dropper Over the Laser Beam
 
-**Hardware:** Piezo linear actuator (dropper stage), actuator controller
+**Hardware:** Thorlabs Z812 linear actuator, Thorlabs KCube DC Motor Controller (KDC101), dropper chassis assembly
 **Automation:** `procedures/proc_position_dropper.py`
 **Module:** `modules/mod_dropper_stage.py`
 
-With the chamber at loading pressure, the glass slide must be translated laterally so that the sphere-coated region is directly above the laser beam waist.  This is done with a piezo linear actuator that moves the dropper assembly along one axis.
+### Dropper assembly construction
 
-The operator sets a target position (in the actuator's native units) and the procedure drives the stage to that position.  A live readback of the current position is displayed in the procedure tab.  The correct position is typically known from a previous trapping run and saved as a named preset.
+The dropper is a custom assembly.  A thin glass strip cleaved from a microscope slide is used as a cantilevered springboard.  A PA4CEW 2×2×2 mm, 150 V piezo stack chip (Thorlabs) is epoxied to the glass strip using 353NDPK high-temperature, high-vacuum-compatible epoxy (also Thorlabs).  The key requirements are a small piezo stack and an epoxy rated for high vacuum and bake-out temperatures — the specific product choices above satisfy these but substitutes that meet the same requirements are acceptable.
 
-**Why this matters:** If the slide is not correctly positioned the spheres fall too far from the beam axis to be captured, regardless of how aggressively the shaker is driven.  Even a fraction of a millimeter misalignment can reduce the trapping rate substantially.
+The glass strip with its epoxied piezo is installed in a custom aluminum chassis.  The chassis surrounds the dropper from below except at the far end, which has an aperture of approximately 1 mm diameter.  Microspheres are deposited on the underside of the tip of the glass strip; to fall into the trapping beam they must pass through this aperture.  The tight aperture geometry is what makes positioning straightforward: alignment is achieved when the aperture is centered on the beam axis.
 
-*Details of the actuator hardware, communication interface, and position calibration will be added here as the module is implemented.*
+The chassis assembly is mounted on a translation stage.  The stage is also fitted with a glass coverslip positioned below the trap focus.  The coverslip prevents any spheres that miss the trap from falling directly onto the collection optics below.
+
+### Translation stage hardware
+
+The translation stage is driven by a **Thorlabs Z812** motorized linear actuator (12 mm travel) controlled by a **Thorlabs KDC101 KCube DC Servo Motor Controller**.  The KDC101 communicates over USB using the Thorlabs Kinesis SDK.  The Python interface uses [pylablib](https://pylablib.readthedocs.io/) (`pip install pylablib`) with the Kinesis DLLs installed on the host.
+
+**Module:** [`modules/mod_dropper_stage.py`](modules/mod_dropper_stage.py)
+**Serial number (lab unit):** 27006288
+
+The module exposes three named presets (editable in the GUI, stored in `modules/dropper_stage_state.json`):
+
+| Preset | Default position | Description |
+|---|---|---|
+| `retrieval` | 5.0 mm | Stage position for physically accessing or replacing the dropper assembly |
+| `dropping` | 6.5 mm | Aperture aligned with both beams; spheres fall into trap |
+| `retraction` | 11.0 mm | Coverslip clear of trapping beams; used after a sphere is confirmed trapped |
+
+These positions are stable across sessions and are typically unchanged unless the dropper assembly is replaced, in which case `dropping` may shift by ~1 mm.  The last commanded position is recorded to `dropper_stage_state.json` on every move so the GUI can display it on next boot (before homing resets the encoder).
+
+**Motor parameters:** Default velocity 1 mm/s, acceleration 1 mm/s².  A config value of 0.0 for any motion parameter means "keep whatever is stored in the KDC101" — the controller remembers its last Kinesis-configured values in non-volatile memory, so the first time the module is used all motion parameters can be left at 0.0 and the device's factory/Kinesis defaults apply.
+
+**Available commands:** `home`, `move_to` (absolute mm), `move_to_preset` (`retrieval` / `dropping` / `retraction`), `jog` (forward or reverse, configurable step size).
+
+### Positioning procedure and optical feedback
+
+With the chamber at loading pressure, the stage is driven inward (toward the beam axis) from its fully retracted position.  The correct dropper position is identified optically using the 532 nm alignment laser, which is co-aligned with the 1064 nm trapping beam.
+
+The 532 nm beam is detected outside the chamber on the same balanced photodiodes used for x/y position sensing of a trapped sphere.  The 532 signal provides three distinct states as the stage moves:
+
+| Stage position | 532 signal on BPD | Meaning |
+|---|---|---|
+| Fully retracted | Strong | No obstruction; open beam path |
+| Chassis blocking aperture | Near zero | Chassis wall is in the beam |
+| Aperture aligned with beam | Moderate (attenuated) | Beam passes through coverslip, aperture, and sphere-coated glass tip |
+
+The attenuation in the aligned state is real and expected: the beam passes through the coverslip (which may carry a light dusting of spheres despite cleaning efforts) and through the end of the glass strip, which has microspheres deposited on it.  The moderate signal is nonetheless clearly distinguishable from the zero-signal (blocked) state and from the strong signal (fully retracted) state.
+
+The same signature is visible on the camera.  In practice, the correct position is saved as a named preset (in actuator encoder counts) from a previous run.  The procedure drives to the saved position and the operator confirms using the live photodiode readback.
+
+**Why this matters:** If the aperture is not aligned with the beam, spheres cannot fall into the trap regardless of how aggressively the shaker piezo is driven.  Even sub-millimeter misalignment is enough to block all spheres at the aperture.  The optical feedback makes alignment unambiguous.
 
 ---
 
@@ -101,25 +140,34 @@ The shaker is driven in bursts while the operator (or the trap-detection procedu
 
 ## Stage 6: Confirm a Sphere is Trapped
 
-**Hardware:** Balance photodiode (BPD, in-loop), camera
+**Hardware:** Balanced photodiodes (BPD, x and y axes), camera, FPGA
 **Automation:** Planned — live monitor within `proc_shake_dropper.py`
 **FPGA registers:** BPD amplitude indicators (read-only)
 
-A trapped sphere scatters strongly from the trapping beam and produces a characteristic jump in the balance photodiode signal recorded by the FPGA.  The procedure monitors the relevant FPGA indicator registers in `on_fpga_update()` and flags a trapping event when the signal exceeds a configurable threshold.
+While the shaker is running, the dropper aperture is aligned with the beam (Stage 4) and the 532 nm alignment laser is transmitting a moderate signal through the assembly.  A sphere falling through the aperture and entering the trap focus produces a characteristic change in the BPD signal.  The sphere scatters the 532 nm probe beam and the trapping 1064 nm beam, and its presence is visible on both the photodiodes and the camera.
 
-The camera provides a secondary confirmation — the sphere is visible as a bright spot at the trap focus.  Camera integration is planned as an optional live-view panel within the trapping procedure.
+The detection context is important: during the shaking phase the 532 signal is already attenuated (beam is passing through the dropper assembly), so the trapping event appears as a further change in signal character — not a simple threshold crossing on an otherwise quiet baseline.  The exact signature depends on sphere size and trap depth and will be characterised when the detection logic is implemented.
 
-*Threshold values and indicator register names will be documented here when the detection logic is implemented.*
+The balanced photodiodes read x and y position of scattered 532 nm light; the FPGA records the in-loop BPD signal.  The procedure monitors the relevant FPGA indicator registers in `on_fpga_update()` and flags a trapping event when the signal change exceeds a configurable threshold or exhibits a recognisable pattern.
+
+The camera provides independent confirmation — the sphere appears as a bright spot at the trap focus and its presence can be confirmed visually or via a simple thresholded frame-difference.  Camera integration is planned as an optional live-view panel within the procedure tab.
+
+*Threshold values, indicator register names, and the precise detection signature will be documented here when the detection logic is implemented.*
 
 ---
 
 ## Stage 7: Retract the Dropper
 
-**Hardware:** Piezo linear actuator (same as Stage 4)
+**Hardware:** Thorlabs Z812 / KDC101 (same as Stage 4)
 **Automation:** `procedures/proc_position_dropper.py` (retract preset)
 **Module:** `modules/mod_dropper_stage.py`
 
-After a sphere is confirmed trapped, the glass slide is retracted so it no longer obstructs the beam path or the detection optics.  The retract position is a named preset in the dropper stage module.  The procedure moves the stage to this position and confirms arrival.
+After a sphere is confirmed trapped, the stage is driven back to its fully retracted position.  This accomplishes two things:
+
+1. **Removes the dropper from the optical path** — the glass tip, the sphere deposit on it, and the chassis aperture are all withdrawn, eliminating any scattering or clipping of the 532 nm and 1064 nm beams that would interfere with position detection of the trapped sphere.
+2. **Removes the coverslip** — the coverslip mounted on the translation stage is pulled out from below the trap focus.  Any spheres that settled on the coverslip during loading are removed, and the coverslip itself no longer contributes any optical background to the detection beams.
+
+The retract position is a named preset (encoder counts).  Completion is confirmed when the 532 nm signal on the BPD returns to its strong, unattenuated level — i.e., the open-beam condition is restored.
 
 ---
 
@@ -202,4 +250,4 @@ The `FPGAController` in `fpga_core.py` is the authoritative interface to the FPG
 
 ---
 
-*Last updated: 2026-04-16*
+*Last updated: 2026-04-16 — Stage 4 updated with Z812/KDC101 module detail; mod_dropper_stage.py implemented*

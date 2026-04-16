@@ -13,11 +13,12 @@ Run with:
 from __future__ import annotations
 
 import datetime
+import importlib.util
 import json
 import sys
 from pathlib import Path
 
-from PyQt5.QtCore import QObject, Qt, pyqtSignal
+from PyQt5.QtCore import QObject, QThread, Qt, pyqtSignal
 from PyQt5.QtGui import QFont, QIcon
 from PyQt5.QtWidgets import (
     QApplication,
@@ -40,6 +41,8 @@ from PyQt5.QtWidgets import (
 )
 
 from fpga_core import FPGAConfig, FPGAController, load_last_session, _append_log
+from modules import discover_hardware_modules
+from procedures.base import LiveFPGAFacade
 from fpga_registers import (
     Access,
     Category,
@@ -94,6 +97,271 @@ def _float(edit: QLineEdit) -> float:
         return float(edit.text().strip())
     except ValueError:
         return 0.0
+
+
+# ---------------------------------------------------------------------------
+# Hardware modules tab
+# ---------------------------------------------------------------------------
+
+class _ModulesWidget(QWidget):
+    """
+    Config and test panel for hardware modules (modules/mod_*.py).
+
+    Discovers modules at construction time.  Each module gets a collapsible
+    QGroupBox whose fields are driven by the module's CONFIG_FIELDS list.
+    A "Test" button runs module.test() in a worker thread and reports the
+    result inline.
+
+    Call get_all_configs() to retrieve {MODULE_NAME: {key: value}} for
+    passing to procedures that need to talk to instruments.
+    """
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self._modules = discover_hardware_modules()
+        self._fields: dict[str, dict[str, QLineEdit]] = {}
+        self._status_labels: dict[str, QLabel] = {}
+        self._test_workers: list[QThread] = []
+        self._build_ui()
+
+    def _build_ui(self) -> None:
+        outer = QVBoxLayout(self)
+        outer.setContentsMargins(0, 0, 0, 0)
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        container = QWidget()
+        layout = QVBoxLayout(container)
+        layout.setSpacing(10)
+        layout.setContentsMargins(8, 8, 8, 8)
+
+        if not self._modules:
+            layout.addWidget(QLabel("No hardware modules found in modules/"))
+        else:
+            for mod in self._modules:
+                layout.addWidget(self._make_module_group(mod))
+
+        layout.addStretch()
+        scroll.setWidget(container)
+        outer.addWidget(scroll)
+
+    def _make_module_group(self, mod) -> QGroupBox:
+        grp = QGroupBox(mod.DEVICE_NAME)
+        grp.setCheckable(True)
+        gl = QVBoxLayout(grp)
+
+        field_widgets: dict[str, QLineEdit] = {}
+        for field in mod.CONFIG_FIELDS:
+            key      = field["key"]
+            label    = field.get("label", key)
+            default  = field.get("default", "")
+            tooltip  = field.get("tooltip", "")
+
+            row = QHBoxLayout()
+            lbl = QLabel(f"{label}:")
+            lbl.setFixedWidth(180)
+            row.addWidget(lbl)
+            edit = QLineEdit(str(default))
+            edit.setFixedWidth(150)
+            if tooltip:
+                edit.setToolTip(tooltip)
+            row.addWidget(edit)
+            row.addStretch()
+            gl.addLayout(row)
+            field_widgets[key] = edit
+
+        self._fields[mod.MODULE_NAME] = field_widgets
+
+        # Test button + inline status
+        test_row = QHBoxLayout()
+        test_btn = QPushButton("Test")
+        test_btn.setFixedWidth(70)
+        test_btn.clicked.connect(lambda _, m=mod: self._run_test(m))
+        status_lbl = QLabel("")
+        status_lbl.setStyleSheet("color: gray; font-size: 10px;")
+        test_row.addWidget(test_btn)
+        test_row.addWidget(status_lbl, stretch=1)
+        gl.addLayout(test_row)
+
+        self._status_labels[mod.MODULE_NAME] = status_lbl
+        return grp
+
+    def _run_test(self, mod) -> None:
+        config = self.get_module_config(mod.MODULE_NAME)
+        lbl = self._status_labels[mod.MODULE_NAME]
+        lbl.setText("Testing…")
+        lbl.setStyleSheet("color: gray; font-size: 10px;")
+
+        class _Worker(QThread):
+            done = pyqtSignal(bool, str)
+            def __init__(self, m, cfg):
+                super().__init__()
+                self._m, self._cfg = m, cfg
+            def run(self):
+                ok, msg = self._m.test(self._cfg)
+                self.done.emit(ok, msg)
+
+        w = _Worker(mod, config)
+        w.done.connect(lambda ok, msg, n=mod.MODULE_NAME: self._on_test_done(n, ok, msg))
+        w.finished.connect(lambda: self._test_workers.remove(w) if w in self._test_workers else None)
+        self._test_workers.append(w)
+        w.start()
+
+    def _on_test_done(self, module_name: str, ok: bool, msg: str) -> None:
+        lbl = self._status_labels.get(module_name)
+        if lbl:
+            lbl.setText(msg)
+            lbl.setStyleSheet(
+                f"color: {'green' if ok else 'red'}; font-size: 10px;")
+
+    def get_module_config(self, module_name: str) -> dict:
+        """Return {key: value} for a single module's config fields."""
+        return {k: e.text().strip()
+                for k, e in self._fields.get(module_name, {}).items()}
+
+    def get_all_configs(self) -> dict[str, dict]:
+        """Return {MODULE_NAME: {key: value}} for all modules."""
+        return {name: self.get_module_config(name) for name in self._fields}
+
+
+# ---------------------------------------------------------------------------
+# Procedures tab
+# ---------------------------------------------------------------------------
+
+class _ProcedureManagerWidget(QWidget):
+    """
+    Manages loading and unloading of control procedures (procedures/proc_*.py).
+
+    Each available procedure is listed with a Load / Unload button.  Loading
+    instantiates the procedure, injects a LiveFPGAFacade, calls create_widget(),
+    and adds the resulting widget as a new top-level tab.  Unloading removes
+    the tab and calls teardown().
+
+    Call notify_fpga_update(state) each monitor cycle to forward the FPGA
+    register snapshot to all loaded procedures' on_fpga_update() hooks.
+    """
+
+    def __init__(self, tabs: QTabWidget, fpga_controller: FPGAController,
+                 parent=None):
+        super().__init__(parent)
+        self._tabs = tabs
+        self._ctrl = fpga_controller
+        self._loaded: dict[str, tuple[object, QWidget]] = {}
+        self._buttons: dict[str, QPushButton] = {}
+        self._available: list = []
+
+        try:
+            from procedures import discover_procedures
+            self._available = discover_procedures()
+        except Exception as exc:
+            print(f"[procedures] Discovery failed: {exc}")
+
+        self._build_ui()
+
+    def _build_ui(self) -> None:
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(8, 8, 8, 8)
+        layout.setSpacing(8)
+
+        header = QLabel(
+            "<b>Control Procedures</b><br>"
+            "<span style='color:gray; font-size:10px;'>"
+            "Load a procedure to add its control tab to the GUI.  "
+            "The FPGA must be connected before running any procedure.</span>"
+        )
+        header.setWordWrap(True)
+        layout.addWidget(header)
+
+        if not self._available:
+            layout.addWidget(QLabel(
+                "No procedures found in procedures/  "
+                "(files must be named proc_*.py and expose a Procedure class)."))
+            layout.addStretch()
+            return
+
+        for cls in self._available:
+            grp = QGroupBox(cls.NAME)
+            gl = QVBoxLayout(grp)
+
+            if cls.DESCRIPTION:
+                desc = QLabel(cls.DESCRIPTION)
+                desc.setWordWrap(True)
+                desc.setStyleSheet("color: gray; font-size: 10px;")
+                gl.addWidget(desc)
+
+            btn_row = QHBoxLayout()
+            btn = QPushButton("Load")
+            btn.setFixedWidth(90)
+            btn.setStyleSheet(
+                "QPushButton { background-color: #2563eb; color: white; "
+                "font-weight: bold; padding: 3px 8px; border-radius: 3px; }"
+                "QPushButton:hover { background-color: #3b82f6; }"
+            )
+            btn.clicked.connect(lambda _, c=cls: self._toggle(c))
+            self._buttons[cls.NAME] = btn
+            btn_row.addWidget(btn)
+            btn_row.addStretch()
+            gl.addLayout(btn_row)
+            layout.addWidget(grp)
+
+        layout.addStretch()
+
+    def _toggle(self, cls) -> None:
+        if cls.NAME in self._loaded:
+            self._unload(cls.NAME)
+        else:
+            self._load(cls)
+
+    def _load(self, cls) -> None:
+        proc = cls()
+        proc.fpga = LiveFPGAFacade(self._ctrl)
+        try:
+            widget = proc.create_widget()
+        except Exception as exc:
+            print(f"[procedures] {cls.NAME} create_widget failed: {exc}")
+            return
+        self._tabs.addTab(widget, proc.NAME)
+        self._loaded[proc.NAME] = (proc, widget)
+        self._tabs.setCurrentWidget(widget)
+        btn = self._buttons.get(proc.NAME)
+        if btn:
+            btn.setText("Unload")
+            btn.setStyleSheet(
+                "QPushButton { background-color: #c0392b; color: white; "
+                "font-weight: bold; padding: 3px 8px; border-radius: 3px; }"
+                "QPushButton:hover { background-color: #e74c3c; }"
+            )
+
+    def _unload(self, name: str) -> None:
+        proc, widget = self._loaded.pop(name)
+        idx = self._tabs.indexOf(widget)
+        if idx >= 0:
+            self._tabs.removeTab(idx)
+        try:
+            proc.teardown()
+        except Exception as exc:
+            print(f"[procedures] {name} teardown error: {exc}")
+        widget.deleteLater()
+        btn = self._buttons.get(name)
+        if btn:
+            btn.setText("Load")
+            btn.setStyleSheet(
+                "QPushButton { background-color: #2563eb; color: white; "
+                "font-weight: bold; padding: 3px 8px; border-radius: 3px; }"
+                "QPushButton:hover { background-color: #3b82f6; }"
+            )
+
+    def notify_fpga_update(self, state: dict) -> None:
+        """Forward the FPGA register snapshot to all loaded procedures."""
+        for name, (proc, _widget) in self._loaded.items():
+            try:
+                proc.on_fpga_update(state)
+            except Exception as exc:
+                print(f"[procedures] {name} on_fpga_update error: {exc}")
+
+    def teardown_all(self) -> None:
+        """Teardown all loaded procedures (call on app close)."""
+        for name in list(self._loaded.keys()):
+            self._unload(name)
 
 
 # ---------------------------------------------------------------------------
@@ -154,6 +422,14 @@ class FPGAMainWindow(QMainWindow):
         tabs.addTab(self._build_outputs_tab(), "Outputs")
         tabs.addTab(self._build_registers_tab(), "All Registers")
         tabs.addTab(self._build_plot_tab(), "Monitor")
+
+        # Hardware modules config / test panel
+        self._modules_widget = _ModulesWidget()
+        tabs.addTab(self._modules_widget, "Modules")
+
+        # Procedure manager (Load / Unload buttons; loaded procedures add more tabs)
+        self._proc_manager = _ProcedureManagerWidget(tabs, self._ctrl)
+        tabs.addTab(self._proc_manager, "Procedures")
 
     # ------------------------------------------------------------------
     # Connection tab
@@ -796,6 +1072,7 @@ class FPGAMainWindow(QMainWindow):
 
     def _on_registers_updated(self, values: dict) -> None:
         self._update_reg_edits(values)
+        self._proc_manager.notify_fpga_update(values)
 
     def _on_plot_data(self, values: dict) -> None:
         self._plot_widget.push_values(values)
@@ -1027,6 +1304,7 @@ class FPGAMainWindow(QMainWindow):
     # ==================================================================
 
     def closeEvent(self, event) -> None:
+        self._proc_manager.teardown_all()
         self._ctrl.disconnect()
         super().closeEvent(event)
 
