@@ -398,7 +398,7 @@ class FPGAController:
                     break
                 time.sleep(0.001)
 
-            self.write_register("write_address", float(i))
+            self.write_register("write_address", i)
             for c in range(min(n_cols, 3)):
                 self.write_register(buf_names[c], float(data[i, c]))
 
@@ -477,10 +477,23 @@ class FPGAController:
     def _write_one(self, name: str, value: float, reg: RegisterDef) -> None:
         """Write one register (caller holds _lock)."""
         if self._session is not None:
+            nifpga_reg = self._session.registers[name]
             if reg.is_bool:
-                self._session.registers[name].write(bool(value))
+                nifpga_reg.write(bool(value))
+            elif reg.is_integer:
+                nifpga_reg.write(int(round(value)))
             else:
-                self._session.registers[name].write(value)
+                # FXP / SGL / DBL registers expect float.  If the LabVIEW VI
+                # uses an integer type that isn't yet flagged with is_integer,
+                # ctypes raises TypeError — catch it and retry as int so the
+                # write succeeds; mark the register is_integer to fix it properly.
+                try:
+                    nifpga_reg.write(value)
+                except TypeError:
+                    nifpga_reg.write(int(round(value)))
+                    self._log(
+                        f"[type warning] {name!r} rejected float — "
+                        "wrote as int. Set is_integer=True in fpga_registers.py.")
         else:
             self._sim_regs[name] = value
 

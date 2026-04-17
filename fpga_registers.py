@@ -48,6 +48,7 @@ class RegisterDef:
     category: Category
     access: Access = Access.RW
     is_bool: bool = False
+    is_integer: bool = False   # True for I8/U8/I16/U16/I32/U32/I64/U64 FPGA types
     description: str = ""
 
 
@@ -60,7 +61,7 @@ REGISTERS: list[RegisterDef] = [
     # --- Status / timing ---
     RegisterDef("Stop",                   Category.STATUS, Access.RW, is_bool=True, description="Stop FPGA loop"),
     RegisterDef("FPGA Error Out",         Category.STATUS, Access.READ, description="Error indicator from FPGA"),
-    RegisterDef("Count(uSec)",            Category.STATUS, Access.READ, description="Microsecond tick counter"),
+    RegisterDef("Count(uSec)",            Category.STATUS, Access.READ, is_integer=True, description="Microsecond tick counter"),
 
     # --- Z axis ---
     RegisterDef("Z Setpoint",             Category.Z_AXIS, description="Z feedback setpoint"),
@@ -192,19 +193,19 @@ REGISTERS: list[RegisterDef] = [
     RegisterDef("Arb gain (ch0)",         Category.ARB_WAVEFORM, description="Arb waveform gain ch0"),
     RegisterDef("Arb gain (ch1)",         Category.ARB_WAVEFORM, description="Arb waveform gain ch1"),
     RegisterDef("Arb gain (ch2)",         Category.ARB_WAVEFORM, description="Arb waveform gain ch2"),
-    RegisterDef("write_address",          Category.ARB_WAVEFORM, description="Waveform write address"),
+    RegisterDef("write_address",          Category.ARB_WAVEFORM, is_integer=True, description="Waveform write address"),
     RegisterDef("data_buffer_1",          Category.ARB_WAVEFORM, description="Data buffer 1"),
     RegisterDef("data_buffer2",           Category.ARB_WAVEFORM, description="Data buffer 2"),
     RegisterDef("data_buffer3",           Category.ARB_WAVEFORM, description="Data buffer 3"),
-    RegisterDef("Arb steps per cycle",    Category.ARB_WAVEFORM, description="Steps per waveform cycle"),
+    RegisterDef("Arb steps per cycle",    Category.ARB_WAVEFORM, is_integer=True, description="Steps per waveform cycle"),
     RegisterDef("ready_to_write",         Category.ARB_WAVEFORM, Access.READ, description="Buffer write ready"),
-    RegisterDef("written_address",        Category.ARB_WAVEFORM, Access.READ, description="Last written address"),
+    RegisterDef("written_address",        Category.ARB_WAVEFORM, Access.READ, is_integer=True, description="Last written address"),
 
     # --- EOM ---
     RegisterDef("EOM_amplitude",          Category.EOM, description="EOM drive amplitude"),
     RegisterDef("EOM_threshold",          Category.EOM, description="EOM threshold (0 to 1)"),
     RegisterDef("EOM reset",              Category.EOM, is_bool=True, description="Reset EOM"),
-    RegisterDef("EOM_seed",               Category.EOM, description="EOM random seed"),
+    RegisterDef("EOM_seed",               Category.EOM, is_integer=True, description="EOM random seed"),
     RegisterDef("EOM_offset",             Category.EOM, description="EOM DC offset (-10 to 10 V)"),
     RegisterDef("eom sine frequency (periods/tick)", Category.EOM, description="EOM sine frequency"),
     RegisterDef("Amplitude_sine_EOM",     Category.EOM, description="Sine amplitude for EOM"),
@@ -218,7 +219,7 @@ REGISTERS: list[RegisterDef] = [
     RegisterDef("duty cycle (periods)",   Category.COM_OUTPUT, description="COM output duty cycle"),
 
     # --- Global ---
-    RegisterDef("Big Number",             Category.GLOBAL, Access.READ, description="Counter tick"),
+    RegisterDef("Big Number",             Category.GLOBAL, Access.READ, is_integer=True, description="Counter tick"),
     RegisterDef("X_emergency_threshould", Category.GLOBAL, description="X emergency threshold"),
     RegisterDef("Y_emergency_threshould", Category.GLOBAL, description="Y emergency threshold"),
     RegisterDef("No_integral_gain",       Category.GLOBAL, is_bool=True, description="Disable integral gain globally"),
