@@ -24,10 +24,13 @@ import time
 
 import numpy as np
 import pyqtgraph as pg
-from PyQt5.QtCore import Qt, QTimer
+from PyQt5.QtCore import Qt, QSettings, QTimer
 from PyQt5.QtWidgets import (
+    QCheckBox,
     QComboBox,
     QDialog,
+    QGridLayout,
+    QGroupBox,
     QHBoxLayout,
     QLabel,
     QPushButton,
@@ -103,21 +106,35 @@ class _RingBuffer:
 
 # ── PSD dialog (on-demand, matplotlib) ────────────────────────────────────
 
+_SHORT_COL = {"sensor": "Sensor", "feedback": "FB", "total": "Total FB"}
+
+# Ordered list of (reg_name, axis, col_key) for all 9 channels
+_ALL_CHANNELS: list[tuple[str, str, str]] = [
+    (col["template"].format(a=axis), axis, col["key"])
+    for axis in GRID_ROWS
+    for col in GRID_COLS
+]
+
+_SETTINGS = QSettings("MooreLab", "usphere-FPGA")
+
+
 class PSDDialog(QDialog):
-    """One-shot PSD from current ring-buffer snapshot."""
+    """On-demand PSD with per-channel visibility checkboxes."""
 
     def __init__(self, times: np.ndarray,
                  data: dict[str, np.ndarray], parent=None):
         super().__init__(parent)
-        self.setWindowTitle("PSD — All Axes")
-        self.resize(800, 480)
+        self.setWindowTitle("PSD")
+        self.resize(900, 560)
         self.setAttribute(Qt.WA_DeleteOnClose)
 
         self._times = times
         self._data = data
+        self._checks: dict[str, QCheckBox] = {}
 
         layout = QVBoxLayout(self)
 
+        # ── top bar: window selector ──────────────────────────────────
         top = QHBoxLayout()
         top.addWidget(QLabel("Window:"))
         self._win_combo = QComboBox()
@@ -127,10 +144,38 @@ class PSDDialog(QDialog):
         top.addStretch()
         layout.addLayout(top)
 
-        self._fig = Figure(figsize=(8, 4), tight_layout=True)
+        # ── channel selector (3×3 grid) ───────────────────────────────
+        grp = QGroupBox("Channels")
+        grid = QGridLayout(grp)
+        grid.setHorizontalSpacing(16)
+        # Header row
+        for c, col_def in enumerate(GRID_COLS):
+            lbl = QLabel(f"<b>{_SHORT_COL[col_def['key']]}</b>")
+            lbl.setAlignment(Qt.AlignCenter)
+            grid.addWidget(lbl, 0, c + 1)
+        for r, axis in enumerate(GRID_ROWS):
+            grid.addWidget(QLabel(f"<b>{axis}</b>"), r + 1, 0)
+            for c, col_def in enumerate(GRID_COLS):
+                reg_name = col_def["template"].format(a=axis)
+                cb = QCheckBox()
+                cb.setChecked(
+                    _SETTINGS.value(f"psd_ch/{reg_name}", True, type=bool))
+                cb.toggled.connect(self._on_check_toggled)
+                grid.addWidget(cb, r + 1, c + 1, alignment=Qt.AlignHCenter)
+                self._checks[reg_name] = cb
+        layout.addWidget(grp)
+
+        # ── matplotlib plot ───────────────────────────────────────────
+        self._fig = Figure(figsize=(9, 4), tight_layout=True)
         self._ax = self._fig.add_subplot(111)
         self._canvas = FigureCanvas(self._fig)
-        layout.addWidget(self._canvas)
+        layout.addWidget(self._canvas, stretch=1)
+
+        self._recompute()
+
+    def _on_check_toggled(self) -> None:
+        for reg_name, cb in self._checks.items():
+            _SETTINGS.setValue(f"psd_ch/{reg_name}", cb.isChecked())
         self._recompute()
 
     def _recompute(self) -> None:
@@ -159,19 +204,18 @@ class PSDDialog(QDialog):
             self._canvas.draw()
             return
 
-        for reg_name, vs in self._data.items():
-            if len(vs) != n:
+        for reg_name, axis, col_key in _ALL_CHANNELS:
+            cb = self._checks.get(reg_name)
+            if cb is not None and not cb.isChecked():
+                continue
+            vs = self._data.get(reg_name)
+            if vs is None or len(vs) != n:
                 continue
             windowed = (vs - np.mean(vs)) * win
             fft_vals = np.fft.rfft(windowed)
             psd = (2.0 / (fs * win_norm)) * np.abs(fft_vals) ** 2
             freqs = np.fft.rfftfreq(n, d=1.0 / fs)
-            color = None
-            for axis in GRID_ROWS:
-                for col in GRID_COLS:
-                    if col["template"].format(a=axis) == reg_name:
-                        color = _COLORS.get((axis, col["key"]))
-                        break
+            color = _COLORS.get((axis, col_key))
             label = reg_name.replace(" plot", "")
             if len(freqs) > 1:
                 ax.plot(freqs[1:], psd[1:], label=label,

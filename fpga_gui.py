@@ -102,10 +102,20 @@ def _make_edit(value: float = 0.0, readonly: bool = False,
     return edit
 
 
-def _fmt(v: float) -> str:
+def _fmt(v: float, is_integer: bool = False) -> str:
+    if is_integer:
+        return str(int(round(v)))
     if v != 0 and (abs(v) < 0.001 or abs(v) >= 1e6):
         return f"{v:.6e}"
-    return f"{v:.6f}".rstrip("0").rstrip(".")
+    # Strip trailing zeros but keep at least 3 decimal places
+    s = f"{v:.6f}".rstrip("0")
+    dot_pos = s.find(".")
+    if dot_pos == -1:
+        return s + ".000"
+    decimals = len(s) - dot_pos - 1
+    if decimals < 3:
+        s += "0" * (3 - decimals)
+    return s
 
 
 def _float(edit: QLineEdit) -> float:
@@ -1551,17 +1561,18 @@ class FPGAMainWindow(QMainWindow):
                 continue
             reg = REGISTER_MAP.get(name)
             is_writable = reg is not None and reg.access != Access.READ
+            is_int = reg is not None and reg.is_integer
             if is_writable:
                 # Always refresh the grey live-value label
                 live_lbl = self._reg_live_labels.get(name)
                 if live_lbl is not None:
-                    live_lbl.setText(_fmt(val))
+                    live_lbl.setText(_fmt(val, is_int))
                 # Only push into the editable field on startup / explicit read
                 if initial:
-                    edit.setText(_fmt(val))
+                    edit.setText(_fmt(val, is_int))
             else:
                 # Read-only indicators: always update
-                edit.setText(_fmt(val))
+                edit.setText(_fmt(val, is_int))
 
     # ==================================================================
     # Change pars
