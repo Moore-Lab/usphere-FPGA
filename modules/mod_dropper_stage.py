@@ -52,8 +52,10 @@ The Z812 travel range is 0–12 mm.
 
 from __future__ import annotations
 
+import contextlib
 import datetime
 import json
+import time
 from pathlib import Path
 
 try:
@@ -194,9 +196,19 @@ def get_last_position() -> float | None:
 # Internal helpers
 # ---------------------------------------------------------------------------
 
+@contextlib.contextmanager
 def _open(serial_number: str):
-    """Return an open KinesisMotor context manager for the Z812."""
-    return Thorlabs.KinesisMotor(serial_number, scale="Z812")
+    """Open a KinesisMotor for the Z812 and yield it after a brief settle.
+
+    The KDC101 communicates over USB-serial.  Rapid open/close cycles can
+    leave stale bytes in the OS buffer that are then mis-read as the start
+    of the next response message, producing a "message sync error".  The
+    100 ms sleep after opening gives the driver time to drain any residual
+    data before the first command is sent.
+    """
+    with Thorlabs.KinesisMotor(serial_number, scale="Z812") as motor:
+        time.sleep(0.1)
+        yield motor
 
 
 def _apply_motion_params(stage, config: dict) -> None:

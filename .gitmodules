@@ -1,0 +1,9 @@
+[submodule "resources/KEYSIGHT33500B"]
+	path = resources/KEYSIGHT33500B
+	url = https://github.com/Moore-Lab/KEYSIGHT33500B
+[submodule "resources/EDWARDS-TIC"]
+	path = resources/EDWARDS-TIC
+	url = https://github.com/Moore-Lab/EDWARDS-TIC
+[submodule "resources/Microsphere-Utility-Scripts"]
+	path = resources/Microsphere-Utility-Scripts
+	url = https://github.com/Moore-Lab/Microsphere-Utility-Scripts

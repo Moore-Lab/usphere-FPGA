@@ -1,6 +1,10 @@
 development/
 papers/
-resources/
+resources/*
+!resources/KEYSIGHT33500B
+!resources/usphere-daq
+!resources/EDWARDS-TIC
+!resources/Microsphere-Utility-Scripts
 
 # Python
 __pycache__/
