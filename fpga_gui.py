@@ -451,16 +451,17 @@ class _TICPollWorker(QThread):
 # Main window
 # ---------------------------------------------------------------------------
 
-class FPGAMainWindow(QMainWindow):
+class FPGAWidget(QWidget):
+    """
+    Embeddable FPGA control panel.
 
-    def __init__(self):
+    Pass *controller* to reuse an existing FPGAController (e.g. from
+    ctrl_server.py running in the same process).  When omitted a new
+    controller is created for standalone use.
+    """
+
+    def __init__(self, controller: FPGAController | None = None):
         super().__init__()
-        self.setWindowTitle("usphere — FPGA Control")
-        self.resize(1400, 900)
-
-        icon_path = Path(__file__).parent / "assets" / "Logo_transparent_outlined.PNG"
-        if icon_path.exists():
-            self.setWindowIcon(QIcon(str(icon_path)))
 
         # Signal bridge for thread safety
         self._signals = _Signals()
@@ -470,14 +471,22 @@ class FPGAMainWindow(QMainWindow):
         self._signals.connected.connect(self._on_connected)
         self._signals.disconnected.connect(self._on_disconnected)
 
-        # Backend controller
-        self._ctrl = FPGAController(
-            on_status=self._signals.status_message.emit,
-            on_registers_updated=self._signals.registers_updated.emit,
-            on_plot_data=self._signals.plot_data.emit,
-            on_connected=self._signals.connected.emit,
-            on_disconnected=self._signals.disconnected.emit,
-        )
+        # Backend controller — shared with server when embedded
+        if controller is not None:
+            self._ctrl = controller
+            self._ctrl._on_status             = self._signals.status_message.emit
+            self._ctrl._on_registers_updated  = self._signals.registers_updated.emit
+            self._ctrl._on_plot_data          = self._signals.plot_data.emit
+            self._ctrl._on_connected          = self._signals.connected.emit
+            self._ctrl._on_disconnected       = self._signals.disconnected.emit
+        else:
+            self._ctrl = FPGAController(
+                on_status=self._signals.status_message.emit,
+                on_registers_updated=self._signals.registers_updated.emit,
+                on_plot_data=self._signals.plot_data.emit,
+                on_connected=self._signals.connected.emit,
+                on_disconnected=self._signals.disconnected.emit,
+            )
 
         # Widget maps (populated during build)
         self._reg_edits: dict[str, QLineEdit] = {}       # FPGA register widgets
@@ -509,7 +518,9 @@ class FPGAMainWindow(QMainWindow):
 
     def _build_ui(self) -> None:
         tabs = QTabWidget()
-        self.setCentralWidget(tabs)
+        _layout = QVBoxLayout(self)
+        _layout.setContentsMargins(0, 0, 0, 0)
+        _layout.addWidget(tabs)
 
         tabs.addTab(self._build_connection_tab(), "Connection")
         tabs.addTab(self._build_feedback_tab(), "Feedback")
@@ -2312,11 +2323,28 @@ class FPGAMainWindow(QMainWindow):
 # Entry point
 # ---------------------------------------------------------------------------
 
+class FPGAWindow(QMainWindow):
+    """Standalone window wrapper for FPGAWidget."""
+
+    def __init__(self, controller: FPGAController | None = None):
+        super().__init__()
+        self.setWindowTitle("usphere — FPGA Control")
+        self.resize(1400, 900)
+        icon_path = Path(__file__).parent / "assets" / "Logo_transparent_outlined.PNG"
+        if icon_path.exists():
+            self.setWindowIcon(QIcon(str(icon_path)))
+        self._widget = FPGAWidget(controller=controller)
+        self.setCentralWidget(self._widget)
+
+    def closeEvent(self, event):
+        self._widget.closeEvent(event)
+
+
 def main():
     app = QApplication(sys.argv)
     app.setStyle("Fusion")
 
-    window = FPGAMainWindow()
+    window = FPGAWindow()
     window.show()
 
     sys.exit(app.exec_())
