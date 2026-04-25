@@ -7,6 +7,3 @@
 [submodule "resources/Microsphere-Utility-Scripts"]
 	path = resources/Microsphere-Utility-Scripts
 	url = https://github.com/Moore-Lab/Microsphere-Utility-Scripts
-[submodule "resources/usphere-DAQ"]
-	path = resources/usphere-DAQ
-	url = https://github.com/Moore-Lab/usphere-DAQ
