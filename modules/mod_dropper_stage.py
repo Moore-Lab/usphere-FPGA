@@ -12,6 +12,9 @@ Dependencies
   Kinesis software must be installed (provides the backend DLLs):
   https://www.thorlabs.com/software_pages/ViewSoftwarePage.cfm?Code=Motion_Control
 
+  NOTE: pylablib's scale="Z812" returns positions in METERS (34304E3 steps/m).
+  We pass scale=34304 (steps/mm) explicitly so all position values are in mm.
+
 Module protocol
 ---------------
   MODULE_NAME   "DROPPER_STAGE"
@@ -206,7 +209,7 @@ def _open(serial_number: str):
     100 ms sleep after opening gives the driver time to drain any residual
     data before the first command is sent.
     """
-    with Thorlabs.KinesisMotor(serial_number, scale="Z812") as motor:
+    with Thorlabs.KinesisMotor(serial_number, scale=34304) as motor:
         time.sleep(0.1)
         yield motor
 
