@@ -210,7 +210,7 @@ def _open(serial_number: str):
     data before the first command is sent.
     """
     with Thorlabs.KinesisMotor(serial_number, scale=34304) as motor:
-        time.sleep(0.1)
+        time.sleep(0.5)
         yield motor
 
 
@@ -371,7 +371,7 @@ def command(config: dict, **kwargs) -> dict:
             elif action == "move_to":
                 target = float(kwargs["position_mm"])
                 _validate_position(target)
-                stage.move_to(target, sync=True, timeout=60.0)
+                stage.move_to(target);stage.wait_move(timeout=60.0)
                 pos = stage.get_position()
                 _save_state(pos, note=f"move_to {target:.4f} mm")
                 return {
@@ -395,7 +395,7 @@ def command(config: dict, **kwargs) -> dict:
                 cfg_key, fallback = _PRESETS[preset]
                 target = float(config.get(cfg_key, fallback))
                 _validate_position(target)
-                stage.move_to(target, sync=True, timeout=60.0)
+                stage.move_to(target);stage.wait_move(timeout=60.0)
                 pos = stage.get_position()
                 _save_state(pos, note=f"preset:{preset}")
                 return {
@@ -420,7 +420,7 @@ def command(config: dict, **kwargs) -> dict:
                 current = stage.get_position()
                 target  = current + signed_step
                 _validate_position(target)
-                stage.move_by(signed_step, sync=True, timeout=30.0)
+                stage.move_by(signed_step);stage.wait_move(timeout=60.0)
                 pos = stage.get_position()
                 _save_state(pos, note=f"jog {signed_step:+.4f} mm")
                 return {
