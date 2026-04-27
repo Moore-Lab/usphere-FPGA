@@ -3,49 +3,50 @@ procedures/proc_shake_dropper.py
 
 Control procedure for Stage 5: dropper shaking.
 
-Drives the dropper piezo through the Keysight 33500B AWG to shake
-microspheres off the dropper tip and into the 1064 nm trapping beam.
+Hardware chain
+--------------
+  Keysight 33500B AWG  →  MOSFET gate driver  →  TENMA 72-XXXX power supply  →  dropper piezo
 
-The shaking sequence mirrors the LabVIEW dropper shaker VI:
-  1. Configure the AWG for a continuous linear frequency sweep
-     (default: 100 kHz → 700 kHz, 0.1 s per sweep).
-  2. Enable AWG output.
-  3. Step the AWG amplitude upward in equal increments, waiting a fixed
-     dwell time between steps.
-  4. After the last step (or when Stop is pressed), disable AWG output.
+The AWG drives a MOSFET gate with a continuous frequency sweep
+(default: 100 kHz → 700 kHz, 0.1 s per sweep).  When the gate conducts,
+the TENMA supply voltage appears across the piezo and shakes the dropper tip.
+The AWG amplitude and sweep parameters are fixed throughout the sequence —
+only the supply voltage is stepped.
 
-The operator monitors the BPD signal on the FPGA for the moment a sphere
-falls into the trap, then presses Stop and moves to the next stage.
-
-Default shaking parameters (from trapping-protocol Stage 5 LabVIEW VI):
-  Start amplitude : 0.10 Vpp
-  Step size       : 0.05 Vpp
-  Number of steps : 50
-  Dwell time      : 5.0 s/step
-  → Max amplitude : 0.10 + 50 × 0.05 = 2.60 Vpp
-
-Note on external amplifier
---------------------------
-The LabVIEW VI also controls a voltage-controlled amplifier over COM5
-(command format "VSET1: %.2f") in addition to the AWG sweep.  That device
-is not yet represented by a module in this repo.  For the current iteration
-the AWG amplitude is stepped directly; if the piezo drive chain requires the
-amplifier for sufficient force, an ``mod_dropper_amplifier`` module should
-be added and this procedure updated to step it in sync.
-
-532 nm / BPD trap detection
+Shaking sequence (per step)
 ----------------------------
-The FPGA monitor feeds "AI X plot" and "AI Y plot" register values each
-~200 ms cycle.  While the dropper is in the dropping position, the beam
-is attenuated (moderate signal).  When a sphere is captured, the trap
-modifies the signal slightly; the operator watches the display and confirms
-trapping visually (camera + BPD) before pressing Stop.
+  1. AWG output ON   (gate opens; piezo driven at current supply voltage)
+  2. Wait sweep_time_s  (one frequency sweep completes)
+  3. AWG output OFF
+  4. Set supply to next voltage step (V += step_v, capped at max_v)
+  5. Wait dwell_s   (pause before next step)
+  Repeat for n_steps total steps.
+
+The supply output stays on throughout (the gate controls actual drive).
+
+Voltage ramp parameters
+-----------------------
+  Start voltage  : initial PSU set-point before first sweep trigger
+  Step size      : PSU voltage increment after each sweep
+  Steps          : total number of sweep–ramp cycles
+  Dwell time     : pause after each voltage ramp (before next trigger)
+  Max voltage    : hard cap applied to every set_voltage call (≤ 60 V)
+  → Final voltage after last step = start + steps × step_size (capped at max)
+
+State persistence
+-----------------
+The last voltage and step number are written to ipc/shake_dropper_state.json
+after every completed step so the operator can see where the sequence was
+left if the control program is restarted.  The value is displayed in gray
+in the Voltage Ramp panel on startup.
 """
 
 from __future__ import annotations
 
 import datetime
+import json
 import time
+from pathlib import Path
 
 from PyQt5.QtCore import Qt, QThread, pyqtSignal
 from PyQt5.QtWidgets import (
@@ -64,18 +65,42 @@ from PyQt5.QtWidgets import (
     QWidget,
 )
 
-from modules import mod_keysight_awg as _awg
+import modules.mod_keysight_awg as _awg
+import modules.mod_tenma_psu   as _psu
 from procedures.base import ControlProcedure
 from fpga_ipc import ShakeEventLogger
+
+# ---------------------------------------------------------------------------
+# State file
+# ---------------------------------------------------------------------------
+
+_STATE_FILE = Path(__file__).parent.parent / "ipc" / "shake_dropper_state.json"
+
+
+def _load_state() -> dict:
+    try:
+        return json.loads(_STATE_FILE.read_text(encoding="utf-8"))
+    except (FileNotFoundError, json.JSONDecodeError):
+        return {}
+
+
+def _save_state(voltage_v: float, step: int, total_steps: int, note: str = "") -> None:
+    _STATE_FILE.parent.mkdir(exist_ok=True)
+    state = _load_state()
+    state["last_voltage_v"]    = round(voltage_v, 4)
+    state["last_step"]         = step
+    state["last_total_steps"]  = total_steps
+    state["last_updated"]      = datetime.datetime.now().isoformat()
+    if note:
+        state["last_note"] = note
+    _STATE_FILE.write_text(json.dumps(state, indent=2), encoding="utf-8")
 
 
 # ---------------------------------------------------------------------------
 # Worker — AWG connection test
 # ---------------------------------------------------------------------------
 
-class _TestWorker(QThread):
-    """Runs mod_keysight_awg.test() in a background thread."""
-
+class _AWGTestWorker(QThread):
     finished = pyqtSignal(bool, str)
 
     def __init__(self, config: dict):
@@ -88,13 +113,27 @@ class _TestWorker(QThread):
 
 
 # ---------------------------------------------------------------------------
-# Worker — single AWG command
+# Worker — PSU connection test
 # ---------------------------------------------------------------------------
 
-class _CommandWorker(QThread):
-    """Runs a single mod_keysight_awg.command() call."""
+class _PSUTestWorker(QThread):
+    finished = pyqtSignal(bool, str)
 
-    finished = pyqtSignal(bool, str, float, bool)  # ok, msg, amplitude, output_on
+    def __init__(self, config: dict):
+        super().__init__()
+        self._config = config
+
+    def run(self) -> None:
+        ok, msg = _psu.test(self._config)
+        self.finished.emit(ok, msg)
+
+
+# ---------------------------------------------------------------------------
+# Worker — single AWG command (output on/off)
+# ---------------------------------------------------------------------------
+
+class _AWGCommandWorker(QThread):
+    finished = pyqtSignal(bool, str)
 
     def __init__(self, config: dict, action: str, **kwargs):
         super().__init__()
@@ -104,42 +143,85 @@ class _CommandWorker(QThread):
 
     def run(self) -> None:
         result = _awg.command(self._config, action=self._action, **self._kwargs)
-        ok       = result.get("ok", False)
-        msg      = result.get("message", "")
-        amp      = float(result.get("amplitude_vpp", 0.0))
-        out_on   = bool(result.get("output_on", False))
-        self.finished.emit(ok, msg, amp, out_on)
+        self.finished.emit(result.get("ok", False), result.get("message", ""))
 
 
 # ---------------------------------------------------------------------------
-# Worker — full amplitude-stepping shaking loop
+# Worker — single PSU command
+# ---------------------------------------------------------------------------
+
+class _PSUCommandWorker(QThread):
+    finished = pyqtSignal(bool, str, float, bool)  # ok, msg, voltage_v, output_on
+
+    def __init__(self, config: dict, action: str, **kwargs):
+        super().__init__()
+        self._config = config
+        self._action = action
+        self._kwargs = kwargs
+
+    def run(self) -> None:
+        result = _psu.command(self._config, action=self._action, **self._kwargs)
+        self.finished.emit(
+            result.get("ok", False),
+            result.get("message", ""),
+            float(result.get("voltage_v", 0.0)),
+            bool(result.get("output_on", False)),
+        )
+
+
+# ---------------------------------------------------------------------------
+# Worker — full shaking loop
 # ---------------------------------------------------------------------------
 
 class _ShakeWorker(QThread):
     """
-    Runs the amplitude-stepping shaking sequence.
+    Executes the full sweep–ramp shaking sequence.
 
     Each step:
-      1. Set AWG amplitude for this step.
-      2. Wait dwell_s seconds (checking stop flag at 0.1 s intervals).
+      1. AWG output ON
+      2. Wait sweep_time_s  (one sweep)
+      3. AWG output OFF
+      4. Ramp PSU voltage to next step (capped at max_v)
+      5. Save state to disk
+      6. Wait dwell_s  (interruptible)
 
     Emits:
-      step_update(step_number, amplitude_vpp, elapsed_s)  each step
-      finished(ok, message)                               on completion / stop
+      step_update(step_n, voltage_v, elapsed_s)   after each step
+      finished(ok, message)                        on completion or stop
     """
 
-    step_update = pyqtSignal(int, float, float)   # step, amplitude_vpp, elapsed_s
+    step_update = pyqtSignal(int, float, float)   # step, voltage_v, elapsed_s
     finished    = pyqtSignal(bool, str)
 
-    def __init__(self, config: dict, n_steps: int, start_amp: float,
-                 step_amp: float, dwell_s: float):
+    def __init__(
+        self,
+        awg_config:   dict,
+        psu_config:   dict,
+        ch:           int,
+        n_steps:      int,
+        start_v:      float,
+        step_v:       float,
+        max_v:        float,
+        dwell_s:      float,
+        sweep_time_s: float,
+        carrier_amp:  float,
+        start_freq:   float,
+        stop_freq:    float,
+    ):
         super().__init__()
-        self._config    = config
-        self._n_steps   = n_steps
-        self._start_amp = start_amp
-        self._step_amp  = step_amp
-        self._dwell_s   = dwell_s
-        self._stop_flag = False
+        self._awg_config   = awg_config
+        self._psu_config   = psu_config
+        self._ch           = ch
+        self._n_steps      = n_steps
+        self._start_v      = start_v
+        self._step_v       = step_v
+        self._max_v        = max_v
+        self._dwell_s      = dwell_s
+        self._sweep_time_s = sweep_time_s
+        self._carrier_amp  = carrier_amp
+        self._start_freq   = start_freq
+        self._stop_freq    = stop_freq
+        self._stop_flag    = False
 
     def stop(self) -> None:
         self._stop_flag = True
@@ -147,36 +229,93 @@ class _ShakeWorker(QThread):
     def run(self) -> None:
         t0 = time.monotonic()
 
-        for i in range(self._n_steps):
-            if self._stop_flag:
-                self.finished.emit(False, f"Stopped at step {i} of {self._n_steps}.")
-                return
+        try:
+            with _awg.open_awg(self._awg_config) as awg, \
+                 _psu.open_psu(self._psu_config) as psu:
 
-            amp = self._start_amp + i * self._step_amp
-
-            result = _awg.command(self._config, action="set_amplitude", amplitude_vpp=amp)
-            if not result.get("ok"):
-                self.finished.emit(False, f"set_amplitude failed at step {i}: {result.get('message')}")
-                return
-
-            elapsed = time.monotonic() - t0
-            self.step_update.emit(i + 1, amp, elapsed)
-
-            # Wait dwell_s in small slices so we can check the stop flag
-            deadline = time.monotonic() + self._dwell_s
-            while time.monotonic() < deadline:
-                if self._stop_flag:
-                    self.finished.emit(False, f"Stopped at step {i + 1} of {self._n_steps}.")
+                # Configure AWG sweep once (fixed for entire sequence)
+                ok = awg.setup_sweep(
+                    channel    = self._ch,
+                    start_freq = self._start_freq,
+                    stop_freq  = self._stop_freq,
+                    sweep_time = self._sweep_time_s,
+                    waveform   = "sine",
+                    amplitude  = self._carrier_amp,
+                    spacing    = "linear",
+                    trigger    = "immediate",
+                )
+                if not ok:
+                    self.finished.emit(False, "AWG setup_sweep failed")
                     return
-                time.sleep(0.05)
 
-        elapsed = time.monotonic() - t0
-        final_amp = self._start_amp + self._n_steps * self._step_amp
-        self.finished.emit(
-            True,
-            f"Completed {self._n_steps} steps in {elapsed:.1f} s. "
-            f"Final amplitude: {final_amp:.3f} Vpp.",
-        )
+                # Set initial PSU voltage before first trigger
+                current_v = min(self._start_v, self._max_v)
+                if not psu.set_voltage(current_v):
+                    self.finished.emit(False, f"PSU set_voltage({current_v:.2f} V) failed")
+                    return
+
+                for i in range(self._n_steps):
+                    if self._stop_flag:
+                        self.finished.emit(
+                            False,
+                            f"Stopped at step {i} of {self._n_steps}. "
+                            f"Last voltage: {current_v:.2f} V.",
+                        )
+                        return
+
+                    # 1. AWG trigger
+                    if not awg.output_on(self._ch):
+                        self.finished.emit(False, f"AWG output_on failed at step {i+1}")
+                        return
+
+                    # 2. Wait one sweep
+                    time.sleep(self._sweep_time_s)
+
+                    # 3. AWG off
+                    awg.output_off(self._ch)
+
+                    # 4. Ramp PSU to next voltage
+                    next_v = min(self._start_v + (i + 1) * self._step_v, self._max_v)
+                    if not psu.set_voltage(next_v):
+                        self.finished.emit(
+                            False,
+                            f"PSU set_voltage({next_v:.2f} V) failed at step {i+1}",
+                        )
+                        return
+
+                    # Persist state after each completed step
+                    elapsed = time.monotonic() - t0
+                    _save_state(current_v, i + 1, self._n_steps,
+                                note=f"completed step {i+1}/{self._n_steps}")
+                    self.step_update.emit(i + 1, current_v, elapsed)
+
+                    current_v = next_v
+
+                    # 5. Dwell (interruptible)
+                    deadline = time.monotonic() + self._dwell_s
+                    while time.monotonic() < deadline:
+                        if self._stop_flag:
+                            self.finished.emit(
+                                False,
+                                f"Stopped during dwell at step {i+1} of {self._n_steps}. "
+                                f"Last voltage: {current_v:.2f} V.",
+                            )
+                            return
+                        time.sleep(0.05)
+
+                elapsed = time.monotonic() - t0
+                _save_state(
+                    current_v, self._n_steps, self._n_steps,
+                    note=f"completed all {self._n_steps} steps",
+                )
+                self.finished.emit(
+                    True,
+                    f"Completed {self._n_steps} steps in {elapsed:.1f} s. "
+                    f"Final voltage: {current_v:.2f} V.",
+                )
+
+        except Exception as exc:
+            self.finished.emit(False, f"{type(exc).__name__}: {exc}")
 
 
 # ---------------------------------------------------------------------------
@@ -187,16 +326,18 @@ class ShakeDropperWidget(QWidget):
 
     def __init__(self, procedure: "Procedure", parent=None):
         super().__init__(parent)
-        self._procedure   = procedure
-        self._worker: QThread | None = None
-        self._connected   = False
-        self._shaking     = False
+        self._procedure    = procedure
+        self._worker: QThread | None       = None
         self._shake_worker: _ShakeWorker | None = None
-        self._shake_logger = ShakeEventLogger()
-        self._last_step    = 0
-        self._last_amp     = 0.0
+        self._awg_connected = False
+        self._psu_connected = False
+        self._shaking       = False
+        self._shake_logger  = ShakeEventLogger()
+        self._last_step     = 0
+        self._last_voltage  = 0.0
 
         self._build_ui()
+        self._load_last_session()
 
     # ------------------------------------------------------------------
     # UI construction
@@ -212,9 +353,10 @@ class ShakeDropperWidget(QWidget):
         layout.setSpacing(8)
         layout.setContentsMargins(10, 10, 10, 10)
 
-        layout.addWidget(self._build_connection_group())
+        layout.addWidget(self._build_awg_connection_group())
+        layout.addWidget(self._build_psu_connection_group())
         layout.addWidget(self._build_sweep_params_group())
-        layout.addWidget(self._build_shake_params_group())
+        layout.addWidget(self._build_voltage_ramp_group())
         layout.addWidget(self._build_control_group())
         layout.addWidget(self._build_signal_group())
         layout.addWidget(self._build_log_group())
@@ -223,16 +365,18 @@ class ShakeDropperWidget(QWidget):
         scroll.setWidget(container)
         outer.addWidget(scroll)
 
-    def _build_connection_group(self) -> QGroupBox:
-        grp = QGroupBox("AWG Connection")
+    # --- AWG connection ---
+
+    def _build_awg_connection_group(self) -> QGroupBox:
+        grp = QGroupBox("AWG Connection  (Keysight 33500B)")
         l   = QVBoxLayout(grp)
 
         r1 = QHBoxLayout()
         r1.addWidget(QLabel("VISA resource:"))
-        self._resource_edit = QLineEdit(_awg.CONFIG_FIELDS[0]["default"])
-        self._resource_edit.setMinimumWidth(280)
-        self._resource_edit.setToolTip(_awg.CONFIG_FIELDS[0]["tooltip"])
-        r1.addWidget(self._resource_edit)
+        self._awg_resource_edit = QLineEdit(_awg.CONFIG_FIELDS[0]["default"])
+        self._awg_resource_edit.setMinimumWidth(280)
+        self._awg_resource_edit.setToolTip(_awg.CONFIG_FIELDS[0]["tooltip"])
+        r1.addWidget(self._awg_resource_edit)
 
         r1.addWidget(QLabel("Ch:"))
         self._channel_spin = QSpinBox()
@@ -241,37 +385,88 @@ class ShakeDropperWidget(QWidget):
         self._channel_spin.setFixedWidth(45)
         r1.addWidget(self._channel_spin)
 
-        self._connect_btn = QPushButton("Connect")
-        self._connect_btn.setFixedWidth(90)
-        self._connect_btn.setStyleSheet(
+        self._awg_connect_btn = QPushButton("Connect")
+        self._awg_connect_btn.setFixedWidth(90)
+        self._awg_connect_btn.setStyleSheet(
             "QPushButton { background-color: #2563eb; color: white; "
             "font-weight: bold; padding: 3px 8px; border-radius: 3px; }"
             "QPushButton:hover { background-color: #3b82f6; }"
         )
-        self._connect_btn.clicked.connect(self._on_connect)
-        r1.addWidget(self._connect_btn)
+        self._awg_connect_btn.clicked.connect(self._on_awg_connect)
+        r1.addWidget(self._awg_connect_btn)
 
-        self._disconnect_btn = QPushButton("Disconnect")
-        self._disconnect_btn.setFixedWidth(90)
-        self._disconnect_btn.setEnabled(False)
-        self._disconnect_btn.clicked.connect(self._on_disconnect)
-        r1.addWidget(self._disconnect_btn)
+        self._awg_disconnect_btn = QPushButton("Disconnect")
+        self._awg_disconnect_btn.setFixedWidth(90)
+        self._awg_disconnect_btn.setEnabled(False)
+        self._awg_disconnect_btn.clicked.connect(self._on_awg_disconnect)
+        r1.addWidget(self._awg_disconnect_btn)
 
-        self._conn_status = QLabel("Disconnected")
-        self._conn_status.setStyleSheet("color: gray;")
-        r1.addWidget(self._conn_status, stretch=1)
+        self._awg_status = QLabel("Disconnected")
+        self._awg_status.setStyleSheet("color: gray;")
+        r1.addWidget(self._awg_status, stretch=1)
         l.addLayout(r1)
-
         return grp
 
+    # --- PSU connection ---
+
+    def _build_psu_connection_group(self) -> QGroupBox:
+        grp = QGroupBox("Power Supply Connection  (TENMA 72-XXXX)")
+        l   = QVBoxLayout(grp)
+
+        r1 = QHBoxLayout()
+        r1.addWidget(QLabel("Serial port:"))
+        self._psu_port_edit = QLineEdit(_psu.CONFIG_FIELDS[0]["default"])
+        self._psu_port_edit.setFixedWidth(80)
+        self._psu_port_edit.setToolTip(_psu.CONFIG_FIELDS[0]["tooltip"])
+        r1.addWidget(self._psu_port_edit)
+
+        self._psu_connect_btn = QPushButton("Connect")
+        self._psu_connect_btn.setFixedWidth(90)
+        self._psu_connect_btn.setStyleSheet(
+            "QPushButton { background-color: #2563eb; color: white; "
+            "font-weight: bold; padding: 3px 8px; border-radius: 3px; }"
+            "QPushButton:hover { background-color: #3b82f6; }"
+        )
+        self._psu_connect_btn.clicked.connect(self._on_psu_connect)
+        r1.addWidget(self._psu_connect_btn)
+
+        self._psu_disconnect_btn = QPushButton("Disconnect")
+        self._psu_disconnect_btn.setFixedWidth(90)
+        self._psu_disconnect_btn.setEnabled(False)
+        self._psu_disconnect_btn.clicked.connect(self._on_psu_disconnect)
+        r1.addWidget(self._psu_disconnect_btn)
+
+        # Output toggle
+        self._psu_output_btn = QPushButton("Output ON")
+        self._psu_output_btn.setFixedWidth(100)
+        self._psu_output_btn.setEnabled(False)
+        self._psu_output_btn.setStyleSheet(
+            "QPushButton { background-color: #16a34a; color: white; "
+            "font-weight: bold; padding: 3px 8px; border-radius: 3px; }"
+            "QPushButton:hover { background-color: #22c55e; }"
+            "QPushButton:disabled { background-color: #d1d5db; color: #9ca3af; }"
+        )
+        self._psu_output_btn.clicked.connect(self._on_psu_output_toggle)
+        self._psu_output_on = False
+        r1.addWidget(self._psu_output_btn)
+
+        self._psu_status = QLabel("Disconnected")
+        self._psu_status.setStyleSheet("color: gray;")
+        r1.addWidget(self._psu_status, stretch=1)
+        l.addLayout(r1)
+        return grp
+
+    # --- Sweep params ---
+
     def _build_sweep_params_group(self) -> QGroupBox:
-        grp = QGroupBox("Sweep Parameters")
+        grp = QGroupBox("Sweep Parameters  (AWG — fixed during shaking)")
         l   = QHBoxLayout(grp)
 
         for label, attr, default, suffix, lo, hi, step, dec in [
-            ("Start freq:",  "_start_freq_spin", 100.0,  " kHz",  1.0,   30000.0, 10.0, 1),
-            ("Stop freq:",   "_stop_freq_spin",  700.0,  " kHz",  1.0,   30000.0, 10.0, 1),
-            ("Sweep time:",  "_sweep_time_spin",   0.1,  " s",    0.001,    10.0,  0.01, 3),
+            ("Start freq:",     "_start_freq_spin",  100.0,  " kHz", 1.0,   30000.0, 10.0,  1),
+            ("Stop freq:",      "_stop_freq_spin",   700.0,  " kHz", 1.0,   30000.0, 10.0,  1),
+            ("Sweep time:",     "_sweep_time_spin",    0.1,  " s",   0.001,    10.0,  0.01,  3),
+            ("Carrier amp:",    "_carrier_amp_spin",   0.1,  " Vpp", 0.001,    10.0,  0.01,  3),
         ]:
             l.addWidget(QLabel(label))
             spin = QDoubleSpinBox()
@@ -287,21 +482,25 @@ class ShakeDropperWidget(QWidget):
         l.addStretch()
         return grp
 
-    def _build_shake_params_group(self) -> QGroupBox:
-        grp = QGroupBox("Amplitude Ramp  (shaking parameters)")
-        l   = QHBoxLayout(grp)
+    # --- Voltage ramp ---
 
+    def _build_voltage_ramp_group(self) -> QGroupBox:
+        grp = QGroupBox("Voltage Ramp  (PSU set-point steps)")
+        l   = QVBoxLayout(grp)
+
+        param_row = QHBoxLayout()
         for label, attr, default, suffix, lo, hi, step, dec in [
-            ("Start amplitude:", "_start_amp_spin",  0.10, " Vpp", 0.001, 10.0, 0.01, 3),
-            ("Step size:",       "_step_amp_spin",   0.05, " Vpp", 0.001,  5.0, 0.01, 3),
-            ("Steps:",           "_n_steps_spin",    50,   "",     1,    500,   1,   0),
-            ("Dwell time:",      "_dwell_spin",       5.0, " s",   0.1,  60.0,  0.5, 1),
+            ("Start voltage:", "_start_v_spin",  5.0,  " V",  0.0,  60.0,  0.5,  2),
+            ("Step size:",     "_step_v_spin",   2.0,  " V",  0.01, 30.0,  0.5,  2),
+            ("Steps:",         "_n_steps_spin",  10,   "",    1,    500,   1,    0),
+            ("Dwell time:",    "_dwell_spin",     5.0, " s",  0.1,  120.0, 0.5,  1),
+            ("Max voltage:",   "_max_v_spin",    60.0, " V",  0.0,  60.0,  1.0,  1),
         ]:
-            l.addWidget(QLabel(label))
+            param_row.addWidget(QLabel(label))
             if attr == "_n_steps_spin":
                 spin = QSpinBox()
                 spin.setRange(1, 500)
-                spin.setValue(50)
+                spin.setValue(10)
                 spin.setFixedWidth(70)
             else:
                 spin = QDoubleSpinBox()
@@ -312,21 +511,28 @@ class ShakeDropperWidget(QWidget):
                 spin.setSuffix(suffix)
                 spin.setFixedWidth(100)
             setattr(self, attr, spin)
-            l.addWidget(spin)
+            param_row.addWidget(spin)
 
-        # Computed max amplitude label
-        l.addWidget(QLabel("→ max:"))
-        self._max_amp_lbl = QLabel("2.600 Vpp")
-        self._max_amp_lbl.setStyleSheet("font-weight: bold;")
-        l.addWidget(self._max_amp_lbl)
-        l.addStretch()
+        param_row.addWidget(QLabel("→ max:"))
+        self._computed_max_lbl = QLabel("25.00 V")
+        self._computed_max_lbl.setStyleSheet("font-weight: bold;")
+        param_row.addWidget(self._computed_max_lbl)
+        param_row.addStretch()
+        l.addLayout(param_row)
 
-        # Update max amplitude display when parameters change
-        for attr in ("_start_amp_spin", "_step_amp_spin"):
-            getattr(self, attr).valueChanged.connect(self._update_max_amp)
-        self._n_steps_spin.valueChanged.connect(self._update_max_amp)
+        for attr in ("_start_v_spin", "_step_v_spin"):
+            getattr(self, attr).valueChanged.connect(self._update_computed_max)
+        self._n_steps_spin.valueChanged.connect(self._update_computed_max)
 
+        # Last-session hint
+        self._last_session_lbl = QLabel("")
+        self._last_session_lbl.setStyleSheet("color: #9ca3af; font-size: 10px;")
+        l.addWidget(self._last_session_lbl)
+
+        self._update_computed_max()
         return grp
+
+    # --- Control ---
 
     def _build_control_group(self) -> QGroupBox:
         grp = QGroupBox("Shaking Control")
@@ -363,7 +569,6 @@ class ShakeDropperWidget(QWidget):
         btn_row.addStretch()
         l.addLayout(btn_row)
 
-        # Progress row
         progress_row = QHBoxLayout()
         progress_row.addWidget(QLabel("Progress:"))
         self._progress_bar = QProgressBar()
@@ -379,11 +584,11 @@ class ShakeDropperWidget(QWidget):
         self._step_lbl.setStyleSheet("font-family: Consolas; font-weight: bold;")
         progress_row.addWidget(self._step_lbl)
 
-        progress_row.addWidget(QLabel("Amplitude:"))
-        self._amp_lbl = QLabel("—")
-        self._amp_lbl.setFixedWidth(90)
-        self._amp_lbl.setStyleSheet("font-family: Consolas; font-weight: bold;")
-        progress_row.addWidget(self._amp_lbl)
+        progress_row.addWidget(QLabel("Voltage:"))
+        self._volt_lbl = QLabel("—")
+        self._volt_lbl.setFixedWidth(80)
+        self._volt_lbl.setStyleSheet("font-family: Consolas; font-weight: bold;")
+        progress_row.addWidget(self._volt_lbl)
 
         progress_row.addWidget(QLabel("Elapsed:"))
         self._elapsed_lbl = QLabel("—")
@@ -393,6 +598,8 @@ class ShakeDropperWidget(QWidget):
 
         l.addLayout(progress_row)
         return grp
+
+    # --- BPD signal ---
 
     def _build_signal_group(self) -> QGroupBox:
         grp = QGroupBox("BPD Signal  (from FPGA — watch for trap)")
@@ -429,8 +636,9 @@ class ShakeDropperWidget(QWidget):
         hint.setStyleSheet("color: gray; font-size: 10px;")
         hint.setWordWrap(True)
         l.addWidget(hint)
-
         return grp
+
+    # --- Log ---
 
     def _build_log_group(self) -> QGroupBox:
         grp = QGroupBox("Log")
@@ -453,190 +661,272 @@ class ShakeDropperWidget(QWidget):
         sb = self._log_box.verticalScrollBar()
         sb.setValue(sb.maximum())
 
-    def _get_config(self) -> dict:
+    def _awg_config(self) -> dict:
         return {
-            "resource_name":  self._resource_edit.text().strip(),
+            "resource_name":  self._awg_resource_edit.text().strip(),
             "channel":        self._channel_spin.value(),
             "start_freq_hz":  self._start_freq_spin.value() * 1e3,
-            "stop_freq_hz":   self._stop_freq_spin.value() * 1e3,
+            "stop_freq_hz":   self._stop_freq_spin.value()  * 1e3,
             "sweep_time_s":   self._sweep_time_spin.value(),
-            "amplitude_vpp":  self._start_amp_spin.value(),
+            "amplitude_vpp":  self._carrier_amp_spin.value(),
         }
 
-    def _update_max_amp(self) -> None:
-        max_amp = (
-            self._start_amp_spin.value()
-            + self._n_steps_spin.value() * self._step_amp_spin.value()
+    def _psu_config(self) -> dict:
+        return {
+            "serial_port": self._psu_port_edit.text().strip(),
+            "baud_rate":   9600,
+        }
+
+    def _update_computed_max(self) -> None:
+        computed = (
+            self._start_v_spin.value()
+            + self._n_steps_spin.value() * self._step_v_spin.value()
         )
-        self._max_amp_lbl.setText(f"{max_amp:.3f} Vpp")
+        capped = min(computed, self._max_v_spin.value())
+        self._computed_max_lbl.setText(f"{capped:.2f} V")
+
+    def _update_start_btn(self) -> None:
+        self._start_btn.setEnabled(
+            self._awg_connected and self._psu_connected and not self._shaking
+        )
 
     def _set_param_widgets_enabled(self, enabled: bool) -> None:
         for w in (
-            self._resource_edit, self._channel_spin,
-            self._start_freq_spin, self._stop_freq_spin, self._sweep_time_spin,
-            self._start_amp_spin, self._step_amp_spin,
-            self._n_steps_spin, self._dwell_spin,
+            self._awg_resource_edit, self._channel_spin,
+            self._start_freq_spin, self._stop_freq_spin,
+            self._sweep_time_spin, self._carrier_amp_spin,
+            self._psu_port_edit,
+            self._start_v_spin, self._step_v_spin,
+            self._n_steps_spin, self._dwell_spin, self._max_v_spin,
         ):
             w.setEnabled(enabled)
 
+    def _load_last_session(self) -> None:
+        state = _load_state()
+        if not state:
+            return
+        v     = state.get("last_voltage_v")
+        step  = state.get("last_step")
+        total = state.get("last_total_steps")
+        ts    = state.get("last_updated", "")
+        if v is None:
+            return
+        ts_fmt = ""
+        if ts:
+            try:
+                dt = datetime.datetime.fromisoformat(ts)
+                ts_fmt = f" ({dt.strftime('%Y-%m-%d %H:%M')})"
+            except ValueError:
+                pass
+        step_str = f"  step {step} / {total}" if step is not None and total is not None else ""
+        self._last_session_lbl.setText(
+            f"Last session{ts_fmt}: left at {v:.2f} V{step_str}"
+        )
+
     # ------------------------------------------------------------------
-    # Connection
+    # AWG connection
     # ------------------------------------------------------------------
 
-    def _on_connect(self) -> None:
-        self._connect_btn.setEnabled(False)
-        self._conn_status.setText("Connecting…")
-        self._conn_status.setStyleSheet("color: gray;")
-        self._log(f"Connecting to '{self._resource_edit.text().strip()}' …")
-
-        worker = _TestWorker(self._get_config())
-        worker.finished.connect(self._on_connect_done)
+    def _on_awg_connect(self) -> None:
+        self._awg_connect_btn.setEnabled(False)
+        self._awg_status.setText("Connecting…")
+        self._awg_status.setStyleSheet("color: gray;")
+        self._log(f"AWG: connecting to '{self._awg_resource_edit.text().strip()}' …")
+        worker = _AWGTestWorker(self._awg_config())
+        worker.finished.connect(self._on_awg_connect_done)
         worker.start()
         self._worker = worker
 
-    def _on_connect_done(self, ok: bool, msg: str) -> None:
+    def _on_awg_connect_done(self, ok: bool, msg: str) -> None:
         self._worker = None
         if ok:
-            self._connected = True
-            self._conn_status.setText("Connected")
-            self._conn_status.setStyleSheet("color: green; font-weight: bold;")
-            self._disconnect_btn.setEnabled(True)
-            self._start_btn.setEnabled(True)
-            self._log(f"Connected: {msg}")
+            self._awg_connected = True
+            self._awg_status.setText("Connected")
+            self._awg_status.setStyleSheet("color: green; font-weight: bold;")
+            self._awg_disconnect_btn.setEnabled(True)
+            self._log(f"AWG connected: {msg}")
         else:
-            self._connected = False
-            self._conn_status.setText(f"Failed")
-            self._conn_status.setStyleSheet("color: red;")
-            self._connect_btn.setEnabled(True)
-            self._log(f"Connection failed: {msg}")
+            self._awg_connected = False
+            self._awg_status.setText("Failed")
+            self._awg_status.setStyleSheet("color: red;")
+            self._awg_connect_btn.setEnabled(True)
+            self._log(f"AWG connection failed: {msg}")
+        self._update_start_btn()
 
-    def _on_disconnect(self) -> None:
+    def _on_awg_disconnect(self) -> None:
         if self._shaking:
             self._on_stop()
-        self._connected = False
-        self._shaking   = False
-        self._start_btn.setEnabled(False)
-        self._stop_btn.setEnabled(False)
-        self._disconnect_btn.setEnabled(False)
-        self._connect_btn.setEnabled(True)
-        self._conn_status.setText("Disconnected")
-        self._conn_status.setStyleSheet("color: gray;")
-        self._set_param_widgets_enabled(True)
-        self._log("Disconnected.")
+        self._awg_connected = False
+        self._awg_disconnect_btn.setEnabled(False)
+        self._awg_connect_btn.setEnabled(True)
+        self._awg_status.setText("Disconnected")
+        self._awg_status.setStyleSheet("color: gray;")
+        self._update_start_btn()
+        self._log("AWG disconnected.")
+
+    # ------------------------------------------------------------------
+    # PSU connection
+    # ------------------------------------------------------------------
+
+    def _on_psu_connect(self) -> None:
+        self._psu_connect_btn.setEnabled(False)
+        self._psu_status.setText("Connecting…")
+        self._psu_status.setStyleSheet("color: gray;")
+        self._log(f"PSU: connecting on '{self._psu_port_edit.text().strip()}' …")
+        worker = _PSUTestWorker(self._psu_config())
+        worker.finished.connect(self._on_psu_connect_done)
+        worker.start()
+        self._worker = worker
+
+    def _on_psu_connect_done(self, ok: bool, msg: str) -> None:
+        self._worker = None
+        if ok:
+            self._psu_connected = True
+            self._psu_status.setText("Connected")
+            self._psu_status.setStyleSheet("color: green; font-weight: bold;")
+            self._psu_disconnect_btn.setEnabled(True)
+            self._psu_output_btn.setEnabled(True)
+            self._log(f"PSU connected: {msg}")
+        else:
+            self._psu_connected = False
+            self._psu_status.setText("Failed")
+            self._psu_status.setStyleSheet("color: red;")
+            self._psu_connect_btn.setEnabled(True)
+            self._log(f"PSU connection failed: {msg}")
+        self._update_start_btn()
+
+    def _on_psu_disconnect(self) -> None:
+        if self._shaking:
+            self._on_stop()
+        self._psu_connected = False
+        self._psu_output_on = False
+        self._psu_disconnect_btn.setEnabled(False)
+        self._psu_connect_btn.setEnabled(True)
+        self._psu_output_btn.setEnabled(False)
+        self._psu_output_btn.setText("Output ON")
+        self._psu_status.setText("Disconnected")
+        self._psu_status.setStyleSheet("color: gray;")
+        self._update_start_btn()
+        self._log("PSU disconnected.")
+
+    def _on_psu_output_toggle(self) -> None:
+        action = "output_off" if self._psu_output_on else "output_on"
+        self._psu_output_btn.setEnabled(False)
+        worker = _PSUCommandWorker(self._psu_config(), action=action)
+        worker.finished.connect(self._on_psu_output_done)
+        worker.start()
+        self._worker = worker
+
+    def _on_psu_output_done(self, ok: bool, msg: str, voltage_v: float, output_on: bool) -> None:
+        self._worker = None
+        self._psu_output_on = output_on
+        self._psu_output_btn.setEnabled(self._psu_connected and not self._shaking)
+        if output_on:
+            self._psu_output_btn.setText("Output OFF")
+            self._psu_output_btn.setStyleSheet(
+                "QPushButton { background-color: #dc2626; color: white; "
+                "font-weight: bold; padding: 3px 8px; border-radius: 3px; }"
+                "QPushButton:hover { background-color: #ef4444; }"
+                "QPushButton:disabled { background-color: #d1d5db; color: #9ca3af; }"
+            )
+        else:
+            self._psu_output_btn.setText("Output ON")
+            self._psu_output_btn.setStyleSheet(
+                "QPushButton { background-color: #16a34a; color: white; "
+                "font-weight: bold; padding: 3px 8px; border-radius: 3px; }"
+                "QPushButton:hover { background-color: #22c55e; }"
+                "QPushButton:disabled { background-color: #d1d5db; color: #9ca3af; }"
+            )
+        self._log(f"PSU output: {msg}")
 
     # ------------------------------------------------------------------
     # Shaking sequence
     # ------------------------------------------------------------------
 
     def _on_start(self) -> None:
-        if not self._connected:
+        if not (self._awg_connected and self._psu_connected):
             return
 
-        config = self._get_config()
+        awg_cfg = self._awg_config()
+        psu_cfg = self._psu_config()
 
-        # 1. Setup sweep + arm output
-        self._log("Configuring AWG sweep…")
-        self._start_btn.setEnabled(False)
-        self._set_param_widgets_enabled(False)
-
-        worker = _CommandWorker(config, action="setup_sweep",
-                                amplitude_vpp=self._start_amp_spin.value())
-        worker.finished.connect(self._on_setup_done)
-        worker.start()
-        self._worker = worker
-
-    def _on_setup_done(self, ok: bool, msg: str, amp: float, out_on: bool) -> None:
-        self._worker = None
-        self._log(f"{'Setup OK' if ok else 'Setup FAILED'}: {msg}")
-
-        if not ok:
-            self._start_btn.setEnabled(True)
-            self._set_param_widgets_enabled(True)
-            return
-
-        # 2. Output on
-        config = self._get_config()
-        worker = _CommandWorker(config, action="output_on")
-        worker.finished.connect(self._on_output_on_done)
-        worker.start()
-        self._worker = worker
-
-    def _on_output_on_done(self, ok: bool, msg: str, amp: float, out_on: bool) -> None:
-        self._worker = None
-        self._log(f"{'Output ON' if ok else 'Output ON FAILED'}: {msg}")
-
-        if not ok:
-            self._start_btn.setEnabled(True)
-            self._set_param_widgets_enabled(True)
-            return
-
-        # 3. Begin amplitude-stepping loop
         n      = self._n_steps_spin.value()
-        start  = self._start_amp_spin.value()
-        step   = self._step_amp_spin.value()
+        start  = self._start_v_spin.value()
+        step   = self._step_v_spin.value()
+        max_v  = self._max_v_spin.value()
         dwell  = self._dwell_spin.value()
+        ch     = self._channel_spin.value()
 
-        self._last_step = 0
-        self._last_amp  = start
-        self._shake_logger.start(amplitude_vpp=start, step=0)
         self._shaking = True
+        self._last_step    = 0
+        self._last_voltage = start
+        self._start_btn.setEnabled(False)
         self._stop_btn.setEnabled(True)
+        self._psu_output_btn.setEnabled(False)
+        self._set_param_widgets_enabled(False)
         self._progress_bar.setValue(0)
         self._step_lbl.setText(f"0 / {n}")
-        self._amp_lbl.setText(f"{start:.3f} Vpp")
+        self._volt_lbl.setText(f"{start:.2f} V")
         self._elapsed_lbl.setText("0.0 s")
 
-        total_s = n * dwell
+        self._shake_logger.start(amplitude_vpp=start, step=0)
+        total_s = n * (awg_cfg["sweep_time_s"] + dwell)
         self._log(
-            f"Shaking started: {n} steps × {step:.3f} Vpp, "
-            f"{dwell:.1f} s/step  (~{total_s:.0f} s total)"
+            f"Shaking started: {n} steps, "
+            f"{start:.2f}–{min(start + n*step, max_v):.2f} V (step {step:.2f} V), "
+            f"{dwell:.1f} s dwell  (~{total_s:.0f} s total)"
         )
 
         shake_worker = _ShakeWorker(
-            self._get_config(), n, start, step, dwell
+            awg_config   = awg_cfg,
+            psu_config   = psu_cfg,
+            ch           = ch,
+            n_steps      = n,
+            start_v      = start,
+            step_v       = step,
+            max_v        = max_v,
+            dwell_s      = dwell,
+            sweep_time_s = awg_cfg["sweep_time_s"],
+            carrier_amp  = awg_cfg["amplitude_vpp"],
+            start_freq   = awg_cfg["start_freq_hz"],
+            stop_freq    = awg_cfg["stop_freq_hz"],
         )
         shake_worker.step_update.connect(self._on_step_update)
         shake_worker.finished.connect(self._on_shake_done)
         shake_worker.start()
         self._shake_worker = shake_worker
 
-    def _on_step_update(self, step_n: int, amp_vpp: float, elapsed_s: float) -> None:
+    def _on_step_update(self, step_n: int, voltage_v: float, elapsed_s: float) -> None:
         n = self._n_steps_spin.value()
         self._step_lbl.setText(f"{step_n} / {n}")
-        self._amp_lbl.setText(f"{amp_vpp:.3f} Vpp")
+        self._volt_lbl.setText(f"{voltage_v:.2f} V")
         self._elapsed_lbl.setText(f"{elapsed_s:.1f} s")
-        pct = int(100 * step_n / n) if n > 0 else 0
-        self._progress_bar.setValue(pct)
-        self._last_step = step_n
-        self._last_amp  = amp_vpp
+        self._progress_bar.setValue(int(100 * step_n / n) if n > 0 else 0)
+        self._last_step    = step_n
+        self._last_voltage = voltage_v
+        self._last_session_lbl.setText(
+            f"Current session: step {step_n} / {n}, voltage {voltage_v:.2f} V"
+        )
 
     def _on_stop(self) -> None:
         if self._shake_worker is not None and self._shake_worker.isRunning():
-            self._log("Stop requested — will halt after current dwell…")
+            self._log("Stop requested — will halt after current sweep…")
             self._shake_worker.stop()
 
     def _on_shake_done(self, ok: bool, msg: str) -> None:
-        self._shake_logger.stop(amplitude_vpp=self._last_amp, step=self._last_step)
-        self._shaking = False
+        self._shake_logger.stop(
+            amplitude_vpp=self._last_voltage, step=self._last_step
+        )
+        self._shaking      = False
         self._shake_worker = None
         self._log(f"{'Done' if ok else 'Stopped'}: {msg}")
 
         self._stop_btn.setEnabled(False)
         self._progress_bar.setValue(100 if ok else self._progress_bar.value())
-
-        # Turn output off
-        config = self._get_config()
-        self._log("Turning AWG output off…")
-        worker = _CommandWorker(config, action="output_off")
-        worker.finished.connect(self._on_output_off_done)
-        worker.start()
-        self._worker = worker
-
-    def _on_output_off_done(self, ok: bool, msg: str, amp: float, out_on: bool) -> None:
-        self._worker = None
-        self._log(f"Output {'OFF' if ok else 'OFF FAILED'}: {msg}")
-        self._start_btn.setEnabled(self._connected)
+        self._update_start_btn()
+        self._psu_output_btn.setEnabled(self._psu_connected)
         self._set_param_widgets_enabled(True)
+        self._load_last_session()
 
     # ------------------------------------------------------------------
     # FPGA update — BPD display
@@ -685,9 +975,9 @@ class Procedure(ControlProcedure):
     NAME        = "Shake Dropper"
     DESCRIPTION = (
         "Stage 5 — Dropper shaking. "
-        "Drives the dropper piezo via the Keysight 33500B AWG with a "
-        "linear frequency sweep (100–700 kHz) and steps the amplitude "
-        "upward to shake microspheres off the tip and into the trap. "
+        "The Keysight 33500B AWG drives a MOSFET gate with a fixed frequency sweep "
+        "(100–700 kHz); the TENMA power supply voltage is stepped upward each cycle "
+        "to progressively shake microspheres off the dropper tip into the trap. "
         "Displays live BPD signal from the FPGA to monitor for a trapped sphere."
     )
 

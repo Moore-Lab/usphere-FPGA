@@ -43,6 +43,7 @@ discover the first available 33500B on the network/USB.
 
 from __future__ import annotations
 
+import contextlib
 import sys
 from pathlib import Path
 
@@ -152,7 +153,23 @@ def _make_controller(config: dict) -> KS33500BController:
         resource = None
     return KS33500BController(resource_name=resource, timeout=5000)
 
+@contextlib.contextmanager
+def open_awg(config: dict):
+    """
+    Context manager: yield a connected KS33500BController, disconnect on exit.
 
+    Intended for long-running worker threads (e.g. the shake loop) that need
+    to hold the VISA connection open across many output_on/output_off calls
+    rather than reconnecting on every command.
+
+    Raises RuntimeError / ConnectionError on failure (same as _connect).
+    """
+    ctrl = _connect(config)
+    try:
+        yield ctrl
+    finally:
+        ctrl.disconnect()
+        
 def _connect(config: dict) -> KS33500BController:
     """
     Open a connection to the AWG and return the controller.
