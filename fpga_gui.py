@@ -500,6 +500,7 @@ class FPGAWidget(QWidget):
         self._tic_publisher   = TICPublisher()
         self._tic_ctrl        = None   # TICController instance (kept alive while connected)
         self._tic_poll_worker: _TICPollWorker | None = None
+        self._tic_cmd_workers: list = []  # keep command QThreads alive until finished
         self._tic_timer       = QTimer(self)
         self._tic_timer.timeout.connect(self._on_tic_poll)
 
@@ -2240,7 +2241,7 @@ class FPGAWidget(QWidget):
 
         self._tic_tel_status.setText(p.get("status_str", "—"))
         self._tic_tel_speed.setText(
-            _fmt_opt(p.get("speed_pct"),  "d",  " %"))
+            _fmt_opt(p.get("speed_pct"),  ".0f", " %"))
         self._tic_tel_power.setText(
             _fmt_opt(p.get("power_w"),    ".1f", " W"))
         self._tic_tel_current.setText(
@@ -2272,10 +2273,17 @@ class FPGAWidget(QWidget):
         class _W(QThread):
             done = pyqtSignal(bool, str)
             def __init__(self, ctrl): super().__init__(); self._c = ctrl
-            def run(self): ok = self._c.start_pump(); self.done.emit(ok, "Pump started" if ok else "Start failed")
+            def run(self):
+                try:
+                    ok = self._c.start_pump()
+                    self.done.emit(ok, "Pump started" if ok else "Start failed")
+                except Exception as exc:
+                    self.done.emit(False, f"start_pump error: {exc}")
         w = _W(self._tic_ctrl)
         w.done.connect(lambda ok, msg: self._append_status(f"TIC: {msg}"))
         w.done.connect(lambda *_: self._on_tic_poll())
+        self._tic_cmd_workers.append(w)
+        w.finished.connect(lambda: self._tic_cmd_workers.remove(w) if w in self._tic_cmd_workers else None)
         w.start()
 
     def _on_tic_stop_pump(self) -> None:
@@ -2284,10 +2292,17 @@ class FPGAWidget(QWidget):
         class _W(QThread):
             done = pyqtSignal(bool, str)
             def __init__(self, ctrl): super().__init__(); self._c = ctrl
-            def run(self): ok = self._c.stop_pump(); self.done.emit(ok, "Pump stopped" if ok else "Stop failed")
+            def run(self):
+                try:
+                    ok = self._c.stop_pump()
+                    self.done.emit(ok, "Pump stopped" if ok else "Stop failed")
+                except Exception as exc:
+                    self.done.emit(False, f"stop_pump error: {exc}")
         w = _W(self._tic_ctrl)
         w.done.connect(lambda ok, msg: self._append_status(f"TIC: {msg}"))
         w.done.connect(lambda *_: self._on_tic_poll())
+        self._tic_cmd_workers.append(w)
+        w.finished.connect(lambda: self._tic_cmd_workers.remove(w) if w in self._tic_cmd_workers else None)
         w.start()
 
     def _on_tic_set_speed(self) -> None:
@@ -2301,9 +2316,16 @@ class FPGAWidget(QWidget):
         class _W(QThread):
             done = pyqtSignal(bool, str)
             def __init__(self, ctrl, p): super().__init__(); self._c = ctrl; self._p = p
-            def run(self): ok = self._c.set_pump_speed(self._p); self.done.emit(ok, f"Speed setpoint → {self._p}%" if ok else "Set speed failed")
+            def run(self):
+                try:
+                    ok = self._c.set_pump_speed(self._p)
+                    self.done.emit(ok, f"Speed setpoint → {self._p}%" if ok else "Set speed failed")
+                except Exception as exc:
+                    self.done.emit(False, f"set_pump_speed error: {exc}")
         w = _W(self._tic_ctrl, pct)
         w.done.connect(lambda ok, msg: self._append_status(f"TIC: {msg}"))
+        self._tic_cmd_workers.append(w)
+        w.finished.connect(lambda: self._tic_cmd_workers.remove(w) if w in self._tic_cmd_workers else None)
         w.start()
 
     # ==================================================================

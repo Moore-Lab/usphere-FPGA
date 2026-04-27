@@ -7,3 +7,6 @@
 [submodule "resources/Microsphere-Utility-Scripts"]
 	path = resources/Microsphere-Utility-Scripts
 	url = https://github.com/Moore-Lab/Microsphere-Utility-Scripts
+[submodule "resources/TENMA_72-XXXX"]
+	path = resources/TENMA_72-XXXX
+	url = https://github.com/Moore-Lab/TENMA_72-XXXX
