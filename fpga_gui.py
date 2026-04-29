@@ -18,6 +18,7 @@ import json
 import os
 import sys
 import tempfile
+import threading
 from pathlib import Path
 
 import numpy as np
@@ -28,6 +29,7 @@ from PyQt5.QtWidgets import (
     QApplication,
     QCheckBox,
     QComboBox,
+    QDoubleSpinBox,
     QFileDialog,
     QGridLayout,
     QGroupBox,
@@ -35,6 +37,7 @@ from PyQt5.QtWidgets import (
     QLabel,
     QLineEdit,
     QMainWindow,
+    QMessageBox,
     QProgressBar,
     QPushButton,
     QScrollArea,
@@ -66,11 +69,11 @@ from fpga_registers import (
 from fpga_plot import ALL_PLOT_NAMES, FPGAPlotWidget
 from fpga_ipc import TICPublisher
 from arb_waveform import (
+    WaveformResult,
     generate_comb,
     generate_sine,
     generate_triangle,
     generate_trapezoid,
-    save_waveform,
 )
 
 
@@ -430,6 +433,15 @@ _TIC_DIR = Path(__file__).parent / "resources" / "EDWARDS-TIC"
 if _TIC_DIR.exists() and str(_TIC_DIR) not in sys.path:
     sys.path.insert(0, str(_TIC_DIR))
 
+# Ensure solenoid and butterfly valve submodules are importable
+_SOLENOID_DIR = Path(__file__).parent / "resources" / "Solenoid-valve-controller"
+if _SOLENOID_DIR.exists() and str(_SOLENOID_DIR) not in sys.path:
+    sys.path.insert(0, str(_SOLENOID_DIR))
+
+_CV_DIR = Path(__file__).parent / "resources" / "IdealVac-CommandValve"
+if _CV_DIR.exists() and str(_CV_DIR) not in sys.path:
+    sys.path.insert(0, str(_CV_DIR))
+
 
 class _TICPollWorker(QThread):
     """Polls the TIC (gauges + pump telemetry) off the GUI thread."""
@@ -503,6 +515,14 @@ class FPGAWidget(QWidget):
         self._tic_cmd_workers: list = []  # keep command QThreads alive until finished
         self._tic_timer       = QTimer(self)
         self._tic_timer.timeout.connect(self._on_tic_poll)
+
+        # Valve state
+        self._last_pump_state: dict = {}          # updated by TIC poll — used for safety checks
+        self._sv_ctrl         = None              # ValveController (solenoid)
+        self._bv_ctrl         = None              # CommandValveController (butterfly)
+        self._bv_position: float | None = None   # last known butterfly position (degrees)
+        self._bv_ramp_stop: threading.Event | None = None  # set to cancel an in-progress ramp
+        self._valve_cmd_workers: list = []        # keep valve QThreads alive
 
         # Waveform designer state
         self._wd_result = None          # last generated WaveformResult
@@ -882,68 +902,32 @@ class FPGAWidget(QWidget):
         outer = QVBoxLayout(widget)
         outer.setContentsMargins(0, 0, 0, 0)
 
-        scroll = QScrollArea()
-        scroll.setWidgetResizable(True)
-        container = QWidget()
-        layout = QVBoxLayout(container)
-        layout.setSpacing(8)
-        layout.setContentsMargins(8, 8, 8, 8)
+        splitter = QSplitter(Qt.Vertical)
+        splitter.setChildrenCollapsible(False)
 
-        # Waveform designer (generates waveforms for the arb buffer)
-        layout.addWidget(self._build_waveform_designer())
+        gen_scroll = QScrollArea()
+        gen_scroll.setWidgetResizable(True)
+        gen_container = QWidget()
+        gen_layout = QVBoxLayout(gen_container)
+        gen_layout.setContentsMargins(8, 8, 8, 8)
+        gen_layout.setSpacing(4)
+        gen_layout.addWidget(self._build_waveform_designer())
+        gen_layout.addStretch()
+        gen_scroll.setWidget(gen_container)
+        splitter.addWidget(gen_scroll)
 
-        # Buffer file
-        file_grp = QGroupBox("Bead Arbitrary Drive")
-        fl = QVBoxLayout()
+        player_scroll = QScrollArea()
+        player_scroll.setWidgetResizable(True)
+        player_container = QWidget()
+        player_layout = QVBoxLayout(player_container)
+        player_layout.setContentsMargins(8, 8, 8, 8)
+        player_layout.setSpacing(4)
+        player_layout.addWidget(self._build_waveform_player())
+        player_scroll.setWidget(player_container)
+        splitter.addWidget(player_scroll)
 
-        path_row = QHBoxLayout()
-        path_row.addWidget(QLabel("Buffer file path:"))
-        self._arb_file_edit = QLineEdit()
-        path_row.addWidget(self._arb_file_edit, 1)
-        browse_btn = QPushButton("Browse")
-        browse_btn.clicked.connect(self._browse_arb_file)
-        path_row.addWidget(browse_btn)
-        fl.addLayout(path_row)
-
-        write_btn = QPushButton("Write Data to Buffers")
-        write_btn.clicked.connect(self._on_write_arb_buffers)
-        fl.addWidget(write_btn)
-
-        file_grp.setLayout(fl)
-        layout.addWidget(file_grp)
-
-        # Arb gains
-        gain_grp = QGroupBox("Arb Gain")
-        gg = QGridLayout()
-        r = 0
-        r = self._add_reg(gg, r, "Arb gain (ch0)")
-        r = self._add_reg(gg, r, "Arb gain (ch1)")
-        r = self._add_reg(gg, r, "Arb gain (ch2)")
-        r = self._add_reg(gg, r, "Arb steps per cycle")
-        r = self._add_reg(gg, r, "ready_to_write")
-        r = self._add_reg(gg, r, "written_address")
-        gain_grp.setLayout(gg)
-        layout.addWidget(gain_grp)
-
-        # Ramp arb drive
-        ramp_grp = QGroupBox("Ramp Arb Drive")
-        rg = QGridLayout()
-        r = 0
-        r = self._add_host(rg, r, "End value arb (ch0)")
-        r = self._add_host(rg, r, "Step arb (ch0)")
-        r = self._add_host(rg, r, "End value arb (ch1)")
-        r = self._add_host(rg, r, "Step arb (ch1)")
-        r = self._add_host(rg, r, "Delay Time (s) arb")
-        r = self._add_host(rg, r, "z arb scale")
-        ramp_btn = QPushButton("Ramp Arb Drive")
-        ramp_btn.clicked.connect(self._on_ramp_arb)
-        rg.addWidget(ramp_btn, r, 0, 1, 3)
-        ramp_grp.setLayout(rg)
-        layout.addWidget(ramp_grp)
-
-        layout.addStretch()
-        scroll.setWidget(container)
-        outer.addWidget(scroll)
+        splitter.setSizes([450, 500])
+        outer.addWidget(splitter)
         return widget
 
     # ------------------------------------------------------------------
@@ -951,173 +935,263 @@ class FPGAWidget(QWidget):
     # ------------------------------------------------------------------
 
     def _build_waveform_designer(self) -> QGroupBox:
-        """Build the waveform designer: type selector, params, MC, preview."""
-        grp = QGroupBox("Waveform Designer")
+        """Waveform generator: design and save integer DAC-count waveforms."""
+        grp = QGroupBox("Waveform Generator")
         layout = QVBoxLayout(grp)
-        layout.setSpacing(6)
+        layout.setSpacing(5)
 
-        # ---- Common params ----
-        common = QHBoxLayout()
-        common.addWidget(QLabel("Points:"))
+        # Row 1: Points, sample rate, bit depth
+        r1 = QHBoxLayout()
+        r1.addWidget(QLabel("Points:"))
         self._wd_npoints_combo = QComboBox()
-        self._wd_npoints_combo.addItems(
-            ["1000", "2000", "5000", "10000", "20000", "50000", "100000"])
-        self._wd_npoints_combo.setCurrentIndex(3)   # 10 000
-        common.addWidget(self._wd_npoints_combo)
-        common.addSpacing(12)
-        common.addWidget(QLabel("Sample rate (Sa/s):"))
+        self._wd_npoints_combo.addItems([str(2**n) for n in range(10, 18)])
+        self._wd_npoints_combo.setCurrentText("16384")
+        self._wd_npoints_combo.currentTextChanged.connect(self._on_wd_params_changed)
+        r1.addWidget(self._wd_npoints_combo)
+        r1.addSpacing(8)
+        r1.addWidget(QLabel("Sa/s:"))
         self._wd_samplerate_edit = QLineEdit("1000000")
-        self._wd_samplerate_edit.setFixedWidth(100)
-        common.addWidget(self._wd_samplerate_edit)
-        common.addStretch()
-        layout.addLayout(common)
+        self._wd_samplerate_edit.setFixedWidth(90)
+        self._wd_samplerate_edit.textChanged.connect(self._on_wd_params_changed)
+        r1.addWidget(self._wd_samplerate_edit)
+        r1.addSpacing(8)
+        r1.addWidget(QLabel("Bits:"))
+        self._wd_bits_spin = QSpinBox()
+        self._wd_bits_spin.setRange(4, 16)
+        self._wd_bits_spin.setValue(12)
+        self._wd_bits_spin.setFixedWidth(50)
+        self._wd_bits_spin.valueChanged.connect(self._on_wd_resolution_changed)
+        r1.addWidget(self._wd_bits_spin)
+        self._wd_maxcount_lbl = QLabel("max ±2047")
+        self._wd_maxcount_lbl.setStyleSheet("color: gray; font-size: 10px;")
+        r1.addWidget(self._wd_maxcount_lbl)
+        r1.addStretch()
+        layout.addLayout(r1)
 
-        # ---- Per-type parameter tabs ----
+        # Row 2: Volt cal (annotation only) + Amplitude + DC
+        r2 = QHBoxLayout()
+        r2.addWidget(QLabel("Volt cal:"))
+        self._wd_volt_cal_counts = QLineEdit("2047")
+        self._wd_volt_cal_counts.setFixedWidth(50)
+        r2.addWidget(self._wd_volt_cal_counts)
+        r2.addWidget(QLabel("cts ="))
+        self._wd_volt_cal_v = QLineEdit("10")
+        self._wd_volt_cal_v.setFixedWidth(40)
+        r2.addWidget(self._wd_volt_cal_v)
+        r2.addWidget(QLabel("V"))
+        ann_lbl = QLabel("(annotation only)")
+        ann_lbl.setStyleSheet("color: gray; font-size: 10px;")
+        r2.addWidget(ann_lbl)
+        r2.addSpacing(16)
+        r2.addWidget(QLabel("Amplitude (cts):"))
+        self._wd_amplitude_spin = QSpinBox()
+        self._wd_amplitude_spin.setRange(1, 2047)
+        self._wd_amplitude_spin.setValue(2047)
+        self._wd_amplitude_spin.setFixedWidth(70)
+        r2.addWidget(self._wd_amplitude_spin)
+        r2.addSpacing(8)
+        r2.addWidget(QLabel("DC (cts):"))
+        self._wd_dc_spin = QSpinBox()
+        self._wd_dc_spin.setRange(-2047, 2047)
+        self._wd_dc_spin.setValue(0)
+        self._wd_dc_spin.setFixedWidth(70)
+        r2.addWidget(self._wd_dc_spin)
+        r2.addStretch()
+        layout.addLayout(r2)
+
+        # Row 3: Column selector
+        r3 = QHBoxLayout()
+        r3.addWidget(QLabel("Columns:"))
+        self._wd_ncols_spin = QSpinBox()
+        self._wd_ncols_spin.setRange(1, 3)
+        self._wd_ncols_spin.setValue(1)
+        self._wd_ncols_spin.setFixedWidth(45)
+        self._wd_ncols_spin.valueChanged.connect(self._on_wd_ncols_changed)
+        r3.addWidget(self._wd_ncols_spin)
+        r3.addSpacing(8)
+        self._wd_col_btns: list[QPushButton] = []
+        for i in range(3):
+            btn = QPushButton(f"Col {i + 1}")
+            btn.setCheckable(True)
+            btn.setFixedWidth(55)
+            btn.clicked.connect(lambda checked, idx=i: self._on_wd_col_btn_clicked(idx))
+            r3.addWidget(btn)
+            self._wd_col_btns.append(btn)
+        self._wd_col_btns[0].setChecked(True)
+        r3.addStretch()
+        layout.addLayout(r3)
+        self._wd_active_col = 0
+        self._wd_columns: list = [None, None, None]
+        self._on_wd_ncols_changed(1)
+
+        # Waveform type tabs (single-row compact controls)
         self._wd_type_tabs = QTabWidget()
         self._wd_type_tabs.setTabPosition(QTabWidget.North)
 
-        # -- Sine --
+        # Sine
         sine_w = QWidget()
-        sg = QGridLayout(sine_w)
-        sg.addWidget(QLabel("Cycles:"), 0, 0)
-        self._wd_sine_ncycles = QLineEdit("1.0")
-        self._wd_sine_ncycles.setFixedWidth(80)
-        sg.addWidget(self._wd_sine_ncycles, 0, 1)
-        sg.addWidget(QLabel("Phase (°):"), 1, 0)
+        sg = QHBoxLayout(sine_w)
+        sg.setContentsMargins(4, 2, 4, 2)
+        sg.addWidget(QLabel("Cycles:"))
+        self._wd_sine_ncycles = QSpinBox()
+        self._wd_sine_ncycles.setRange(1, 100000)
+        self._wd_sine_ncycles.setValue(1)
+        self._wd_sine_ncycles.setFixedWidth(75)
+        self._wd_sine_ncycles.valueChanged.connect(self._on_wd_params_changed)
+        sg.addWidget(self._wd_sine_ncycles)
+        self._wd_sine_freq_lbl = QLabel("")
+        self._wd_sine_freq_lbl.setStyleSheet("color: gray; font-size: 10px;")
+        sg.addWidget(self._wd_sine_freq_lbl)
+        sg.addSpacing(16)
+        sg.addWidget(QLabel("Phase (°):"))
         self._wd_sine_phase = QLineEdit("0.0")
-        self._wd_sine_phase.setFixedWidth(80)
-        sg.addWidget(self._wd_sine_phase, 1, 1)
-        sg.setColumnStretch(2, 1)
+        self._wd_sine_phase.setFixedWidth(55)
+        sg.addWidget(self._wd_sine_phase)
+        sg.addStretch()
         self._wd_type_tabs.addTab(sine_w, "Sine")
 
-        # -- Triangle --
+        # Triangle
         tri_w = QWidget()
-        tg = QGridLayout(tri_w)
-        tg.addWidget(QLabel("Cycles:"), 0, 0)
-        self._wd_tri_ncycles = QLineEdit("1.0")
-        self._wd_tri_ncycles.setFixedWidth(80)
-        tg.addWidget(self._wd_tri_ncycles, 0, 1)
-        tg.addWidget(QLabel("Symmetry (0–1):"), 1, 0)
-        tg.addWidget(QLabel(
-            "  0=falling saw  0.5=triangle  1=rising saw"),
-            1, 2, 1, 2)
+        tg = QHBoxLayout(tri_w)
+        tg.setContentsMargins(4, 2, 4, 2)
+        tg.addWidget(QLabel("Cycles:"))
+        self._wd_tri_ncycles = QSpinBox()
+        self._wd_tri_ncycles.setRange(1, 100000)
+        self._wd_tri_ncycles.setValue(1)
+        self._wd_tri_ncycles.setFixedWidth(75)
+        self._wd_tri_ncycles.valueChanged.connect(self._on_wd_params_changed)
+        tg.addWidget(self._wd_tri_ncycles)
+        self._wd_tri_freq_lbl = QLabel("")
+        self._wd_tri_freq_lbl.setStyleSheet("color: gray; font-size: 10px;")
+        tg.addWidget(self._wd_tri_freq_lbl)
+        tg.addSpacing(16)
+        tg.addWidget(QLabel("Symmetry:"))
         self._wd_tri_symmetry = QLineEdit("0.5")
-        self._wd_tri_symmetry.setFixedWidth(80)
-        tg.addWidget(self._wd_tri_symmetry, 1, 1)
-        tg.setColumnStretch(4, 1)
+        self._wd_tri_symmetry.setFixedWidth(55)
+        tg.addWidget(self._wd_tri_symmetry)
+        hint = QLabel("0=fall  0.5=tri  1=rise")
+        hint.setStyleSheet("color: gray; font-size: 10px;")
+        tg.addWidget(hint)
+        tg.addStretch()
         self._wd_type_tabs.addTab(tri_w, "Triangle")
 
-        # -- Trapezoid --
+        # Trapezoid
         trap_w = QWidget()
-        trg = QGridLayout(trap_w)
-        trg.addWidget(QLabel("Cycles:"), 0, 0)
-        self._wd_trap_ncycles = QLineEdit("1.0")
-        self._wd_trap_ncycles.setFixedWidth(80)
-        trg.addWidget(self._wd_trap_ncycles, 0, 1)
-        trg.addWidget(QLabel("Rise frac:"), 1, 0)
+        trg = QHBoxLayout(trap_w)
+        trg.setContentsMargins(4, 2, 4, 2)
+        trg.addWidget(QLabel("Cycles:"))
+        self._wd_trap_ncycles = QSpinBox()
+        self._wd_trap_ncycles.setRange(1, 100000)
+        self._wd_trap_ncycles.setValue(1)
+        self._wd_trap_ncycles.setFixedWidth(75)
+        self._wd_trap_ncycles.valueChanged.connect(self._on_wd_params_changed)
+        trg.addWidget(self._wd_trap_ncycles)
+        self._wd_trap_freq_lbl = QLabel("")
+        self._wd_trap_freq_lbl.setStyleSheet("color: gray; font-size: 10px;")
+        trg.addWidget(self._wd_trap_freq_lbl)
+        trg.addSpacing(8)
+        trg.addWidget(QLabel("Rise:"))
         self._wd_trap_rise = QLineEdit("0.1")
-        self._wd_trap_rise.setFixedWidth(80)
-        trg.addWidget(self._wd_trap_rise, 1, 1)
-        trg.addWidget(QLabel("High frac:"), 2, 0)
+        self._wd_trap_rise.setFixedWidth(42)
+        trg.addWidget(self._wd_trap_rise)
+        trg.addWidget(QLabel("High:"))
         self._wd_trap_high = QLineEdit("0.4")
-        self._wd_trap_high.setFixedWidth(80)
-        trg.addWidget(self._wd_trap_high, 2, 1)
-        trg.addWidget(QLabel("Fall frac:"), 3, 0)
+        self._wd_trap_high.setFixedWidth(42)
+        trg.addWidget(self._wd_trap_high)
+        trg.addWidget(QLabel("Fall:"))
         self._wd_trap_fall = QLineEdit("0.1")
-        self._wd_trap_fall.setFixedWidth(80)
-        trg.addWidget(self._wd_trap_fall, 3, 1)
-        self._wd_trap_low_lbl = QLabel("Low frac: 0.400")
+        self._wd_trap_fall.setFixedWidth(42)
+        trg.addWidget(self._wd_trap_fall)
+        self._wd_trap_low_lbl = QLabel("Low:0.400")
         self._wd_trap_low_lbl.setStyleSheet("color: gray; font-size: 10px;")
-        trg.addWidget(self._wd_trap_low_lbl, 4, 0, 1, 3)
+        trg.addWidget(self._wd_trap_low_lbl)
         for e in (self._wd_trap_rise, self._wd_trap_high, self._wd_trap_fall):
             e.textChanged.connect(self._on_wd_trap_frac_changed)
-        trg.setColumnStretch(2, 1)
+        trg.addStretch()
         self._wd_type_tabs.addTab(trap_w, "Trapezoid")
 
-        # -- Freq Comb --
+        # Freq Comb
         comb_w = QWidget()
         cl = QVBoxLayout(comb_w)
-        cl.setSpacing(4)
-
+        cl.setSpacing(3)
+        cl.setContentsMargins(4, 2, 4, 2)
         mode_row = QHBoxLayout()
-        mode_row.addWidget(QLabel("Frequency mode:"))
+        mode_row.addWidget(QLabel("Mode:"))
         self._wd_comb_mode = QComboBox()
         self._wd_comb_mode.addItems(
-            ["List (comma-sep Hz)", "Range (arange)", "Trap fractions"])
+            ["List (Hz)", "Range (arange)", "Trap fractions"])
         mode_row.addWidget(self._wd_comb_mode)
         mode_row.addStretch()
         cl.addLayout(mode_row)
 
         self._wd_comb_stack = QStackedWidget()
 
-        # Page 0: list
         list_w = QWidget()
         ll = QHBoxLayout(list_w)
         ll.setContentsMargins(0, 0, 0, 0)
         ll.addWidget(QLabel("Frequencies (Hz):"))
-        self._wd_comb_list_edit = QLineEdit("100000, 200000, 300000, 400000, 500000, 600000, 700000")
+        self._wd_comb_list_edit = QLineEdit(
+            "100000, 200000, 300000, 400000, 500000, 600000, 700000")
         ll.addWidget(self._wd_comb_list_edit, 1)
         self._wd_comb_stack.addWidget(list_w)
 
-        # Page 1: arange
         arange_w = QWidget()
-        ag = QGridLayout(arange_w)
+        ag = QHBoxLayout(arange_w)
         ag.setContentsMargins(0, 0, 0, 0)
-        ag.addWidget(QLabel("Start (Hz):"), 0, 0)
+        ag.addWidget(QLabel("Start (Hz):"))
         self._wd_comb_arange_start = QLineEdit("100000")
-        self._wd_comb_arange_start.setFixedWidth(90)
-        ag.addWidget(self._wd_comb_arange_start, 0, 1)
-        ag.addWidget(QLabel("Stop (Hz):"), 0, 2)
+        self._wd_comb_arange_start.setFixedWidth(80)
+        ag.addWidget(self._wd_comb_arange_start)
+        ag.addWidget(QLabel("Stop:"))
         self._wd_comb_arange_stop = QLineEdit("700000")
-        self._wd_comb_arange_stop.setFixedWidth(90)
-        ag.addWidget(self._wd_comb_arange_stop, 0, 3)
-        ag.addWidget(QLabel("Step (Hz):"), 0, 4)
+        self._wd_comb_arange_stop.setFixedWidth(80)
+        ag.addWidget(self._wd_comb_arange_stop)
+        ag.addWidget(QLabel("Step:"))
         self._wd_comb_arange_step = QLineEdit("100000")
-        self._wd_comb_arange_step.setFixedWidth(90)
-        ag.addWidget(self._wd_comb_arange_step, 0, 5)
-        ag.setColumnStretch(6, 1)
+        self._wd_comb_arange_step.setFixedWidth(80)
+        ag.addWidget(self._wd_comb_arange_step)
+        ag.addStretch()
         self._wd_comb_stack.addWidget(arange_w)
 
-        # Page 2: trap fractions
         frac_w = QWidget()
-        fg = QGridLayout(frac_w)
+        fg = QHBoxLayout(frac_w)
         fg.setContentsMargins(0, 0, 0, 0)
-        fg.addWidget(QLabel("Trap freq (Hz):"), 0, 0)
+        fg.addWidget(QLabel("Trap freq (Hz):"))
         self._wd_comb_trap_freq = QLineEdit("150000")
-        self._wd_comb_trap_freq.setFixedWidth(90)
-        fg.addWidget(self._wd_comb_trap_freq, 0, 1)
-        fg.addWidget(QLabel("Fractions:"), 0, 2)
+        self._wd_comb_trap_freq.setFixedWidth(80)
+        fg.addWidget(self._wd_comb_trap_freq)
+        fg.addWidget(QLabel("Fracs:"))
         self._wd_comb_fracs_edit = QLineEdit("1, 2, 3, 4, 5")
-        fg.addWidget(self._wd_comb_fracs_edit, 0, 3)
-        fg.setColumnStretch(4, 1)
+        fg.addWidget(self._wd_comb_fracs_edit)
+        fg.addStretch()
         self._wd_comb_stack.addWidget(frac_w)
 
-        self._wd_comb_mode.currentIndexChanged.connect(
-            self._on_wd_comb_mode_changed)
+        self._wd_comb_mode.currentIndexChanged.connect(self._on_wd_comb_mode_changed)
         cl.addWidget(self._wd_comb_stack)
 
         mc_row = QHBoxLayout()
         mc_row.addWidget(QLabel("MC trials:"))
         self._wd_comb_trials = QLineEdit("1000")
-        self._wd_comb_trials.setFixedWidth(70)
+        self._wd_comb_trials.setFixedWidth(60)
         mc_row.addWidget(self._wd_comb_trials)
         mc_row.addStretch()
         cl.addLayout(mc_row)
 
         self._wd_mc_progress = QProgressBar()
         self._wd_mc_progress.setRange(0, 100)
-        self._wd_mc_progress.setFixedHeight(14)
+        self._wd_mc_progress.setFixedHeight(12)
         self._wd_mc_progress.hide()
         cl.addWidget(self._wd_mc_progress)
 
         self._wd_type_tabs.addTab(comb_w, "Freq Comb")
+        self._wd_type_tabs.currentChanged.connect(self._on_wd_params_changed)
         layout.addWidget(self._wd_type_tabs)
 
-        # ---- Generate / Cancel row ----
+        # Generate / Cancel / Save row
         gen_row = QHBoxLayout()
-        self._wd_gen_btn = QPushButton("Generate")
+        self._wd_gen_btn = QPushButton("Generate → Col")
         self._wd_gen_btn.setStyleSheet(
-            "QPushButton { font-weight: bold; padding: 5px 14px; "
+            "QPushButton { font-weight: bold; padding: 4px 12px; "
             "background-color: #2563eb; color: white; border-radius: 3px; }"
             "QPushButton:hover { background-color: #3b82f6; }"
             "QPushButton:disabled { background-color: #93c5fd; }")
@@ -1125,65 +1199,172 @@ class FPGAWidget(QWidget):
         gen_row.addWidget(self._wd_gen_btn)
         self._wd_cancel_btn = QPushButton("Cancel")
         self._wd_cancel_btn.setStyleSheet(
-            "QPushButton { color: #b91c1c; padding: 5px 10px; border-radius: 3px; }"
+            "QPushButton { color: #b91c1c; padding: 4px 8px; border-radius: 3px; }"
             "QPushButton:hover { background-color: #fee2e2; }")
         self._wd_cancel_btn.clicked.connect(self._on_wd_cancel)
         self._wd_cancel_btn.hide()
         gen_row.addWidget(self._wd_cancel_btn)
-        gen_row.addStretch()
-        layout.addLayout(gen_row)
-
-        # ---- Stats row ----
-        stats_row = QHBoxLayout()
-        stats_row.addWidget(QLabel("RMS/peak:"))
-        self._wd_rms_lbl = QLabel("—")
-        self._wd_rms_lbl.setFixedWidth(60)
-        stats_row.addWidget(self._wd_rms_lbl)
-        stats_row.addWidget(QLabel("Crest factor:"))
-        self._wd_crest_lbl = QLabel("—")
-        self._wd_crest_lbl.setFixedWidth(55)
-        stats_row.addWidget(self._wd_crest_lbl)
-        stats_row.addSpacing(8)
+        gen_row.addSpacing(8)
+        save_btn = QPushButton("Write CSV…")
+        save_btn.clicked.connect(self._on_wd_save)
+        gen_row.addWidget(save_btn)
         self._wd_desc_lbl = QLabel("")
         self._wd_desc_lbl.setStyleSheet(
             "color: #6b7280; font-size: 10px; font-style: italic;")
-        stats_row.addWidget(self._wd_desc_lbl, 1)
-        layout.addLayout(stats_row)
+        gen_row.addWidget(self._wd_desc_lbl, 1)
+        layout.addLayout(gen_row)
 
-        # ---- Preview plot ----
+        # Preview plot with twin x-axis (sample index bottom, time top)
         try:
             import pyqtgraph as pg
             self._wd_plot_widget = pg.PlotWidget(background="w")
-            self._wd_plot_widget.setFixedHeight(160)
+            self._wd_plot_widget.setFixedHeight(185)
             pi = self._wd_plot_widget.getPlotItem()
-            pi.setLabel("left", "Amplitude")
+            pi.setLabel("left", "DAC counts")
             pi.setLabel("bottom", "Sample index")
             pi.showGrid(x=True, y=True, alpha=0.25)
-            self._wd_plot_curve = pi.plot(
-                pen=pg.mkPen("#2563eb", width=1.5))
+            pi.showAxis("top")
+            pi.getAxis("top").setLabel("Time")
+            self._wd_plot_curve = pi.plot(pen=pg.mkPen("#2563eb", width=1.5))
+            self._wd_annot = pg.TextItem(anchor=(0, 1), color=(80, 80, 80))
+            self._wd_annot.setZValue(10)
+            pi.addItem(self._wd_annot)
             layout.addWidget(self._wd_plot_widget)
             self._wd_has_plot = True
         except ImportError:
-            layout.addWidget(
-                QLabel("(install pyqtgraph for waveform preview)"))
+            layout.addWidget(QLabel("(install pyqtgraph for waveform preview)"))
             self._wd_has_plot = False
 
-        # ---- Save / Write row ----
-        save_row = QHBoxLayout()
-        self._wd_save_btn = QPushButton("Save to File…")
-        self._wd_save_btn.clicked.connect(self._on_wd_save)
-        save_row.addWidget(self._wd_save_btn)
-        self._wd_write_btn = QPushButton("Write to FPGA")
-        self._wd_write_btn.setStyleSheet(
-            "QPushButton { padding: 5px 10px; background-color: #059669; "
+        return grp
+
+    def _build_waveform_player(self) -> QGroupBox:
+        """Waveform player: load, display (gain-scaled), write to FPGA."""
+        grp = QGroupBox("Waveform Player")
+        layout = QVBoxLayout(grp)
+        layout.setSpacing(5)
+
+        # Row 1: File path + buttons
+        r1 = QHBoxLayout()
+        r1.addWidget(QLabel("File:"))
+        self._arb_file_edit = QLineEdit()
+        r1.addWidget(self._arb_file_edit, 1)
+        browse_btn = QPushButton("Browse")
+        browse_btn.clicked.connect(self._browse_arb_file)
+        r1.addWidget(browse_btn)
+        load_btn = QPushButton("Load & Preview")
+        load_btn.clicked.connect(self._on_player_load)
+        r1.addWidget(load_btn)
+        self._player_write_btn = QPushButton("Write to FPGA")
+        self._player_write_btn.setStyleSheet(
+            "QPushButton { padding: 4px 10px; background-color: #059669; "
             "color: white; border-radius: 3px; font-weight: bold; }"
             "QPushButton:hover { background-color: #10b981; }"
             "QPushButton:disabled { background-color: #6ee7b7; }")
-        self._wd_write_btn.clicked.connect(self._on_wd_write_fpga)
-        save_row.addWidget(self._wd_write_btn)
-        save_row.addStretch()
-        layout.addLayout(save_row)
+        self._player_write_btn.clicked.connect(self._on_write_arb_buffers)
+        r1.addWidget(self._player_write_btn)
+        layout.addLayout(r1)
 
+        # Row 2: Bit depth + Arb gains (inline compact)
+        r2 = QHBoxLayout()
+        r2.addWidget(QLabel("Bits:"))
+        self._player_bits_spin = QSpinBox()
+        self._player_bits_spin.setRange(4, 16)
+        self._player_bits_spin.setValue(12)
+        self._player_bits_spin.setFixedWidth(50)
+        self._player_bits_spin.valueChanged.connect(self._on_player_display_changed)
+        r2.addWidget(self._player_bits_spin)
+        r2.addSpacing(12)
+        for ch, attr in [(0, "_player_gain0_spin"), (1, "_player_gain1_spin"),
+                         (2, "_player_gain2_spin")]:
+            r2.addWidget(QLabel(f"Gain ch{ch}:"))
+            sp = QDoubleSpinBox()
+            sp.setRange(0.0, 1000.0)
+            sp.setValue(10.0)
+            sp.setSingleStep(0.5)
+            sp.setDecimals(2)
+            sp.setFixedWidth(70)
+            setattr(self, attr, sp)
+            r2.addWidget(sp)
+        self._player_gain0_spin.valueChanged.connect(self._on_player_display_changed)
+        set_gain_btn = QPushButton("Set Gains")
+        set_gain_btn.setFixedWidth(75)
+        set_gain_btn.clicked.connect(self._on_player_set_gains)
+        r2.addWidget(set_gain_btn)
+        r2.addStretch()
+        layout.addLayout(r2)
+
+        # Row 3: Ramp controls
+        r3 = QHBoxLayout()
+        self._player_ramp_cb = QCheckBox("Ramp Arb")
+        self._player_ramp_cb.toggled.connect(self._on_player_ramp_toggled)
+        r3.addWidget(self._player_ramp_cb)
+        r3.addWidget(QLabel("End gain:"))
+        self._player_ramp_end = QDoubleSpinBox()
+        self._player_ramp_end.setRange(0.0, 1000.0)
+        self._player_ramp_end.setValue(10.0)
+        self._player_ramp_end.setDecimals(2)
+        self._player_ramp_end.setFixedWidth(65)
+        self._player_ramp_end.setEnabled(False)
+        self._player_ramp_end.valueChanged.connect(self._on_player_update_ramp_preview)
+        r3.addWidget(self._player_ramp_end)
+        r3.addWidget(QLabel("Step:"))
+        self._player_ramp_step = QDoubleSpinBox()
+        self._player_ramp_step.setRange(0.001, 1000.0)
+        self._player_ramp_step.setValue(0.5)
+        self._player_ramp_step.setDecimals(3)
+        self._player_ramp_step.setFixedWidth(65)
+        self._player_ramp_step.setEnabled(False)
+        self._player_ramp_step.valueChanged.connect(self._on_player_update_ramp_preview)
+        r3.addWidget(self._player_ramp_step)
+        r3.addWidget(QLabel("Delay (s):"))
+        self._player_ramp_delay = QDoubleSpinBox()
+        self._player_ramp_delay.setRange(0.001, 3600.0)
+        self._player_ramp_delay.setValue(1.0)
+        self._player_ramp_delay.setDecimals(3)
+        self._player_ramp_delay.setFixedWidth(70)
+        self._player_ramp_delay.setEnabled(False)
+        r3.addWidget(self._player_ramp_delay)
+        self._player_ramp_btn = QPushButton("Start Ramp")
+        self._player_ramp_btn.setEnabled(False)
+        self._player_ramp_btn.clicked.connect(self._on_ramp_arb)
+        r3.addWidget(self._player_ramp_btn)
+        r3.addStretch()
+        layout.addLayout(r3)
+
+        # Player plot with column tabs
+        try:
+            import pyqtgraph as pg
+            self._player_tabs = QTabWidget()
+            self._player_tabs.setTabPosition(QTabWidget.North)
+            self._player_plot_widgets: list = []
+            self._player_plot_curves: list = []
+            self._player_ramp_curves: list = []
+            for i in range(3):
+                pw = pg.PlotWidget(background="w")
+                pw.setMinimumHeight(200)
+                pi = pw.getPlotItem()
+                pi.setLabel("left", "0.1 × gain × count / max")
+                pi.setLabel("bottom", "Sample index")
+                pi.showGrid(x=True, y=True, alpha=0.25)
+                curve = pi.plot(pen=pg.mkPen("#059669", width=1.5),
+                                name="Waveform")
+                ramp_c = pi.plot(pen=pg.mkPen("#dc2626", width=1.2,
+                                              style=Qt.DashLine),
+                                 name="Gain envelope")
+                self._player_plot_widgets.append(pw)
+                self._player_plot_curves.append(curve)
+                self._player_ramp_curves.append(ramp_c)
+                self._player_tabs.addTab(pw, f"Col {i + 1}")
+            layout.addWidget(self._player_tabs, 1)
+            self._player_has_plot = True
+            for i in range(1, 3):
+                self._player_tabs.setTabVisible(i, False)
+        except ImportError:
+            layout.addWidget(
+                QLabel("(install pyqtgraph for waveform display)"))
+            self._player_has_plot = False
+
+        self._player_data: list = [None, None, None]
         return grp
 
     # ------------------------------------------------------------------
@@ -1297,6 +1478,7 @@ class FPGAWidget(QWidget):
         self._plot_poll_spin.setRange(5, 1000)
         self._plot_poll_spin.setValue(self._ctrl.config.plot_interval_ms)
         self._plot_poll_spin.setSuffix(" ms")
+        self._plot_poll_spin.valueChanged.connect(self._on_plot_poll_changed)
         top.addWidget(self._plot_poll_spin)
         top.addStretch()
 
@@ -1673,14 +1855,18 @@ class FPGAWidget(QWidget):
         if not self._ctrl.is_connected:
             self._append_status("Not connected.")
             return
-        host = self._gather_host_params()
-        delay = host.get("Delay Time (s) arb", 0.001)
-        for ch_idx, ch_name in [(0, "Arb gain (ch0)"), (1, "Arb gain (ch1)")]:
-            target = host.get(f"End value arb (ch{ch_idx})", 0)
-            step = host.get(f"Step arb (ch{ch_idx})", 0)
+        try:
+            delay = self._player_ramp_delay.value()
+            end   = self._player_ramp_end.value()
+            step  = self._player_ramp_step.value()
+            start = self._player_gain0_spin.value()
             if step > 0:
-                self._ctrl.ramp_register(ch_name, target, step, delay)
-                self._append_status(f"Ramping {ch_name} → {target}")
+                self._ctrl.ramp_register("Arb gain (ch0)", end, step, delay)
+                self._append_status(
+                    f"Ramping Arb gain (ch0): {start:.2f} → {end:.2f} "
+                    f"step={step:.3f} delay={delay:.3f} s")
+        except Exception as exc:
+            self._append_status(f"Ramp arb error: {exc}")
 
     # ==================================================================
     # Waveform designer handlers
@@ -1695,12 +1881,86 @@ class FPGAWidget(QWidget):
             h = float(self._wd_trap_high.text() or "0")
             f = float(self._wd_trap_fall.text() or "0")
             low = 1.0 - r - h - f
-            self._wd_trap_low_lbl.setText(f"Low frac: {low:.3f}")
+            self._wd_trap_low_lbl.setText(f"Low:{low:.3f}")
             self._wd_trap_low_lbl.setStyleSheet(
                 "color: red; font-size: 10px;" if low < -0.001
                 else "color: gray; font-size: 10px;")
         except ValueError:
-            self._wd_trap_low_lbl.setText("Low frac: —")
+            self._wd_trap_low_lbl.setText("Low:—")
+
+    def _on_wd_params_changed(self, *_) -> None:
+        """Update derived frequency labels when points/sample-rate/cycles change."""
+        try:
+            n_points = int(self._wd_npoints_combo.currentText())
+            sample_rate = float(self._wd_samplerate_edit.text() or "1e6")
+        except ValueError:
+            return
+        for ncycles_spin, freq_lbl in [
+            (self._wd_sine_ncycles,  self._wd_sine_freq_lbl),
+            (self._wd_tri_ncycles,   self._wd_tri_freq_lbl),
+            (self._wd_trap_ncycles,  self._wd_trap_freq_lbl),
+        ]:
+            n_cyc = ncycles_spin.value()
+            if n_points > 0 and sample_rate > 0:
+                freq = sample_rate * n_cyc / n_points
+                if freq >= 1e6:
+                    freq_lbl.setText(f"→ {freq / 1e6:.3f} MHz")
+                elif freq >= 1e3:
+                    freq_lbl.setText(f"→ {freq / 1e3:.3f} kHz")
+                else:
+                    freq_lbl.setText(f"→ {freq:.3f} Hz")
+            else:
+                freq_lbl.setText("")
+
+    def _on_wd_resolution_changed(self, bits: int) -> None:
+        max_count = 2 ** (bits - 1) - 1
+        self._wd_maxcount_lbl.setText(f"max ±{max_count}")
+        self._wd_amplitude_spin.setRange(1, max_count)
+        self._wd_amplitude_spin.setValue(
+            min(self._wd_amplitude_spin.value(), max_count))
+        self._wd_dc_spin.setRange(-max_count, max_count)
+
+    def _on_wd_ncols_changed(self, n: int) -> None:
+        for i, btn in enumerate(self._wd_col_btns):
+            btn.setVisible(i < n)
+        if self._wd_active_col >= n:
+            self._on_wd_col_btn_clicked(0)
+
+    def _on_wd_col_btn_clicked(self, idx: int) -> None:
+        self._wd_active_col = idx
+        for i, btn in enumerate(self._wd_col_btns):
+            btn.setChecked(i == idx)
+
+    def _wd_get_int_samples(self, normalized: "np.ndarray") -> "np.ndarray":
+        """Convert normalized [-1,+1] float array to clipped integer DAC counts."""
+        bits = self._wd_bits_spin.value()
+        max_count = 2 ** (bits - 1) - 1
+        amp = self._wd_amplitude_spin.value()
+        dc = self._wd_dc_spin.value()
+        raw = np.round(normalized * amp + dc).astype(np.int32)
+        return np.clip(raw, -max_count, max_count)
+
+    def _wd_update_top_axis(self, n_points: int, sample_rate: float) -> None:
+        """Set time-labelled ticks on the top x-axis of the generator preview."""
+        if not self._wd_has_plot or n_points <= 0 or sample_rate <= 0:
+            return
+        import pyqtgraph as pg
+        pi = self._wd_plot_widget.getPlotItem()
+        ax = pi.getAxis("top")
+        tick_count = 5
+        positions = [int(n_points * i / tick_count) for i in range(tick_count + 1)]
+
+        def _fmt(t: float) -> str:
+            if t < 1e-6:
+                return f"{t * 1e9:.1f} ns"
+            if t < 1e-3:
+                return f"{t * 1e6:.1f} µs"
+            if t < 1:
+                return f"{t * 1e3:.2f} ms"
+            return f"{t:.3f} s"
+
+        labels = [_fmt(p / sample_rate) for p in positions]
+        ax.setTicks([list(zip(positions, labels))])
 
     def _on_wd_generate(self) -> None:
         try:
@@ -1710,63 +1970,50 @@ class FPGAWidget(QWidget):
             return
 
         tab_idx = self._wd_type_tabs.currentIndex()
-
         try:
-            if tab_idx == 0:                        # Sine
-                n_cycles   = float(self._wd_sine_ncycles.text() or "1.0")
-                phase_deg  = float(self._wd_sine_phase.text()   or "0.0")
-                result     = generate_sine(n_points, n_cycles, phase_deg)
-                self._wd_result = result
-                self._on_wd_update_preview(result)
+            sample_rate = float(self._wd_samplerate_edit.text() or "1e6")
 
-            elif tab_idx == 1:                      # Triangle
-                n_cycles  = float(self._wd_tri_ncycles.text()  or "1.0")
-                symmetry  = float(self._wd_tri_symmetry.text() or "0.5")
-                result    = generate_triangle(n_points, n_cycles, symmetry)
-                self._wd_result = result
-                self._on_wd_update_preview(result)
+            if tab_idx == 0:        # Sine
+                n_cyc = self._wd_sine_ncycles.value()
+                phase = float(self._wd_sine_phase.text() or "0.0")
+                result = generate_sine(n_points, n_cyc, phase)
 
-            elif tab_idx == 2:                      # Trapezoid
-                n_cycles = float(self._wd_trap_ncycles.text() or "1.0")
-                rise     = float(self._wd_trap_rise.text()    or "0.1")
-                high     = float(self._wd_trap_high.text()    or "0.4")
-                fall     = float(self._wd_trap_fall.text()    or "0.1")
-                result   = generate_trapezoid(n_points, n_cycles, rise, high, fall)
-                self._wd_result = result
-                self._on_wd_update_preview(result)
+            elif tab_idx == 1:      # Triangle
+                n_cyc = self._wd_tri_ncycles.value()
+                sym = float(self._wd_tri_symmetry.text() or "0.5")
+                result = generate_triangle(n_points, n_cyc, sym)
 
-            elif tab_idx == 3:                      # Freq Comb (MC)
-                sample_rate = float(self._wd_samplerate_edit.text() or "1e6")
-                mode        = self._wd_comb_mode.currentIndex()
-                if mode == 0:   # list
-                    freqs = [
-                        float(x.strip())
-                        for x in self._wd_comb_list_edit.text().split(",")
-                        if x.strip()
-                    ]
-                elif mode == 1:   # arange
+            elif tab_idx == 2:      # Trapezoid
+                n_cyc = self._wd_trap_ncycles.value()
+                rise = float(self._wd_trap_rise.text() or "0.1")
+                high = float(self._wd_trap_high.text() or "0.4")
+                fall = float(self._wd_trap_fall.text() or "0.1")
+                result = generate_trapezoid(n_points, n_cyc, rise, high, fall)
+
+            elif tab_idx == 3:      # Freq Comb (MC)
+                mode = self._wd_comb_mode.currentIndex()
+                if mode == 0:
+                    freqs = [float(x.strip())
+                             for x in self._wd_comb_list_edit.text().split(",")
+                             if x.strip()]
+                elif mode == 1:
                     start = float(self._wd_comb_arange_start.text())
                     stop  = float(self._wd_comb_arange_stop.text())
                     step  = float(self._wd_comb_arange_step.text())
                     freqs = list(np.arange(start, stop + step / 2, step))
-                else:             # trap fractions
+                else:
                     trap_f = float(self._wd_comb_trap_freq.text())
-                    fracs  = [
-                        float(x.strip())
-                        for x in self._wd_comb_fracs_edit.text().split(",")
-                        if x.strip()
-                    ]
+                    fracs  = [float(x.strip())
+                              for x in self._wd_comb_fracs_edit.text().split(",")
+                              if x.strip()]
                     freqs = [trap_f * f for f in fracs]
-
                 if not freqs:
                     self._append_status("Freq comb: no frequencies specified.")
                     return
-
                 n_trials = int(self._wd_comb_trials.text() or "1000")
                 self._wd_mc_stop_flag = [False]
                 self._wd_mc_worker = _CombMCWorker(
-                    n_points, sample_rate, freqs, n_trials,
-                    self._wd_mc_stop_flag)
+                    n_points, sample_rate, freqs, n_trials, self._wd_mc_stop_flag)
                 self._wd_mc_worker.progress.connect(self._on_wd_mc_progress)
                 self._wd_mc_worker.finished.connect(self._on_wd_mc_done)
                 self._wd_gen_btn.setEnabled(False)
@@ -1774,6 +2021,16 @@ class FPGAWidget(QWidget):
                 self._wd_mc_progress.setValue(0)
                 self._wd_mc_progress.show()
                 self._wd_mc_worker.start()
+                return
+            else:
+                return
+
+            int_samples = self._wd_get_int_samples(result.samples)
+            self._wd_columns[self._wd_active_col] = int_samples.copy()
+            self._wd_result = result
+            self._on_wd_update_preview(int_samples, result, n_points, sample_rate)
+            self._wd_desc_lbl.setText(
+                f"Col {self._wd_active_col + 1} stored  |  {result.description}")
 
         except Exception as exc:
             self._append_status(f"Waveform generate error: {exc}")
@@ -1793,61 +2050,177 @@ class FPGAWidget(QWidget):
         self._wd_cancel_btn.hide()
         self._wd_gen_btn.setEnabled(True)
         self._wd_mc_worker = None
+        try:
+            n_points = int(self._wd_npoints_combo.currentText())
+            sample_rate = float(self._wd_samplerate_edit.text() or "1e6")
+        except ValueError:
+            return
+        int_samples = self._wd_get_int_samples(result.samples)
+        self._wd_columns[self._wd_active_col] = int_samples.copy()
         self._wd_result = result
-        self._on_wd_update_preview(result)
+        self._on_wd_update_preview(int_samples, result, n_points, sample_rate)
+        self._wd_desc_lbl.setText(
+            f"Col {self._wd_active_col + 1} stored  |  {result.description}")
 
-    def _on_wd_update_preview(self, result) -> None:
-        self._wd_rms_lbl.setText(f"{result.rms:.4f}")
-        self._wd_crest_lbl.setText(f"{result.crest_factor:.3f}")
-        self._wd_desc_lbl.setText(result.description)
-        if self._wd_has_plot:
-            s = result.samples
-            if len(s) > 2000:
-                s = s[:: len(s) // 2000]
-            self._wd_plot_curve.setData(s)
+    def _on_wd_update_preview(self, int_samples, result,
+                               n_points: int, sample_rate: float) -> None:
+        if not self._wd_has_plot:
+            return
+        x = np.arange(len(int_samples))
+        self._wd_plot_curve.setData(x, int_samples)
+        self._wd_update_top_axis(n_points, sample_rate)
+
+        # Annotation: f and Vpp in physical units
+        try:
+            tab_idx = self._wd_type_tabs.currentIndex()
+            if tab_idx == 0:
+                n_cyc = self._wd_sine_ncycles.value()
+            elif tab_idx == 1:
+                n_cyc = self._wd_tri_ncycles.value()
+            elif tab_idx == 2:
+                n_cyc = self._wd_trap_ncycles.value()
+            else:
+                n_cyc = 1
+            freq_hz = sample_rate * n_cyc / n_points if n_points > 0 else 0
+            if freq_hz >= 1e6:
+                freq_str = f"{freq_hz / 1e6:.4f} MHz"
+            elif freq_hz >= 1e3:
+                freq_str = f"{freq_hz / 1e3:.3f} kHz"
+            else:
+                freq_str = f"{freq_hz:.3f} Hz"
+
+            cal_cts = float(self._wd_volt_cal_counts.text() or "2047")
+            cal_v   = float(self._wd_volt_cal_v.text() or "10")
+            amp_cts = self._wd_amplitude_spin.value()
+            dc_cts  = self._wd_dc_spin.value()
+            vpp_v   = (amp_cts * 2 * cal_v / cal_cts) if cal_cts != 0 else 0
+            dc_v    = (dc_cts * cal_v / cal_cts) if cal_cts != 0 else 0
+            ann = (f"f = {freq_str}   "
+                   f"Vpp = {vpp_v:.3f} V ({amp_cts * 2} cts)   "
+                   f"DC = {dc_v:.3f} V ({dc_cts} cts)")
+            self._wd_annot.setText(ann)
+            pi = self._wd_plot_widget.getPlotItem()
+            vr = pi.viewRange()
+            self._wd_annot.setPos(vr[0][0], vr[1][1])
+        except Exception:
+            pass
 
     def _on_wd_save(self) -> None:
-        if self._wd_result is None:
-            self._append_status("No waveform generated yet.")
+        """Write all active columns to a single integer CSV (no header)."""
+        ncols = self._wd_ncols_spin.value()
+        cols = self._wd_columns[:ncols]
+        if all(c is None for c in cols):
+            self._append_status("No waveform columns generated yet.")
             return
         default_dir = Path(__file__).parent / "waveforms"
         default_dir.mkdir(exist_ok=True)
         path, _ = QFileDialog.getSaveFileName(
-            self, "Save Waveform File",
-            str(default_dir / "waveform.txt"),
-            "Text files (*.txt);;CSV files (*.csv);;All files (*)",
+            self, "Save Waveform CSV",
+            str(default_dir / "waveform.csv"),
+            "CSV files (*.csv);;Text files (*.txt);;All files (*)",
         )
-        if path:
-            save_waveform(self._wd_result, path)
+        if not path:
+            return
+        try:
+            n_points = int(self._wd_npoints_combo.currentText())
+            arrays = []
+            for c in cols:
+                arrays.append(c[:n_points] if c is not None
+                               else np.zeros(n_points, dtype=np.int32))
+            data = (np.column_stack(arrays) if len(arrays) > 1
+                    else arrays[0].reshape(-1, 1))
+            np.savetxt(path, data, fmt="%d", delimiter=",")
             self._arb_file_edit.setText(path)
             self._append_status(
-                f"Waveform saved: {path}  "
-                f"({self._wd_result.n_points} pts, "
-                f"RMS={self._wd_result.rms:.4f})")
+                f"Saved {n_points} rows × {ncols} col(s) → {path}")
+        except Exception as exc:
+            self._append_status(f"Save error: {exc}")
 
-    def _on_wd_write_fpga(self) -> None:
-        if self._wd_result is None:
-            self._append_status("No waveform generated yet.")
+    # ==================================================================
+    # Waveform player handlers
+    # ==================================================================
+
+    def _on_player_load(self) -> None:
+        path = self._arb_file_edit.text().strip()
+        if not path:
+            self._append_status("No file specified.")
             return
+        try:
+            raw = np.loadtxt(path, delimiter=",", ndmin=2)
+            if raw.ndim == 1:
+                raw = raw.reshape(-1, 1)
+            ncols = raw.shape[1]
+            for i in range(3):
+                self._player_data[i] = raw[:, i].astype(float) if i < ncols else None
+                if self._player_has_plot:
+                    self._player_tabs.setTabVisible(i, i < ncols)
+            self._on_player_display_changed()
+            self._append_status(
+                f"Loaded {raw.shape[0]} pts × {ncols} col(s) from {path}")
+        except Exception as exc:
+            self._append_status(f"Load error: {exc}")
+
+    def _on_player_display_changed(self, *_) -> None:
+        if not self._player_has_plot:
+            return
+        bits = self._player_bits_spin.value()
+        max_count = max(1, 2 ** (bits - 1) - 1)
+        gain = self._player_gain0_spin.value()
+        scale = 0.1 * gain / max_count
+        for data, curve in zip(self._player_data, self._player_plot_curves):
+            if data is not None:
+                curve.setData(np.arange(len(data)), data * scale)
+            else:
+                curve.setData([], [])
+        self._on_player_update_ramp_preview()
+
+    def _on_player_ramp_toggled(self, checked: bool) -> None:
+        self._player_ramp_end.setEnabled(checked)
+        self._player_ramp_step.setEnabled(checked)
+        self._player_ramp_delay.setEnabled(checked)
+        self._player_ramp_btn.setEnabled(checked)
+        self._on_player_update_ramp_preview()
+
+    def _on_player_update_ramp_preview(self, *_) -> None:
+        if not self._player_has_plot:
+            return
+        if not self._player_ramp_cb.isChecked():
+            for curve in self._player_ramp_curves:
+                curve.setData([], [])
+            return
+        try:
+            bits = self._player_bits_spin.value()
+            max_count = max(1, 2 ** (bits - 1) - 1)
+            start_gain = self._player_gain0_spin.value()
+            end_gain   = self._player_ramp_end.value()
+            step_gain  = self._player_ramp_step.value()
+            if step_gain <= 0:
+                return
+            n_steps = max(1, round(abs(end_gain - start_gain) / step_gain)) + 1
+            gain_vals = np.linspace(start_gain, end_gain, n_steps)
+            col0 = self._player_data[0]
+            n_buf = len(col0) if col0 is not None and len(col0) > 0 else 1
+            env_x = np.repeat(np.arange(n_steps) * n_buf, 2)[1:-1]
+            env_y = np.repeat(gain_vals * 0.1 / 10.0, 2)[1:-1]
+            for curve in self._player_ramp_curves:
+                curve.setData(env_x, env_y)
+        except Exception:
+            pass
+
+    def _on_player_set_gains(self) -> None:
         if not self._ctrl.is_connected:
             self._append_status("Not connected.")
             return
-        # Write to a temp file so load_arb_waveform can read it
-        tmp_fd, tmppath = tempfile.mkstemp(
-            suffix=".txt", dir=str(Path(__file__).parent))
-        os.close(tmp_fd)
         try:
-            save_waveform(self._wd_result, tmppath)
-            self._ctrl.load_arb_waveform(tmppath)
-            self._append_status(
-                f"Wrote to FPGA arb buffer: {self._wd_result.description}")
+            for reg, sp in [
+                ("Arb gain (ch0)", self._player_gain0_spin),
+                ("Arb gain (ch1)", self._player_gain1_spin),
+                ("Arb gain (ch2)", self._player_gain2_spin),
+            ]:
+                self._ctrl.write_register(reg, sp.value())
+            self._append_status("Arb gains written to FPGA.")
         except Exception as exc:
-            self._append_status(f"Write to FPGA failed: {exc}")
-        finally:
-            try:
-                os.unlink(tmppath)
-            except OSError:
-                pass
+            self._append_status(f"Set gain error: {exc}")
 
     # ==================================================================
     # Arb waveform
@@ -1924,7 +2297,16 @@ class FPGAWidget(QWidget):
             return
         self._ctrl.config.poll_interval_ms = self._poll_spin.value()
         self._ctrl.config.plot_interval_ms = self._plot_poll_spin.value()
+        self._ctrl.stop_monitor()          # restart so new intervals take effect
         self._ctrl.start_monitor(plot_names=ALL_PLOT_NAMES)
+
+    def _on_plot_poll_changed(self, value: int) -> None:
+        """Live-apply plot interval change; restart monitor if running."""
+        self._ctrl.config.plot_interval_ms = value
+        if self._ctrl._monitor_thread is not None and \
+                self._ctrl._monitor_thread.is_alive():
+            self._ctrl.stop_monitor()
+            self._ctrl.start_monitor(plot_names=ALL_PLOT_NAMES)
 
     def _on_stop_monitor(self) -> None:
         self._ctrl.stop_monitor()
@@ -1974,10 +2356,12 @@ class FPGAWidget(QWidget):
     # ==================================================================
 
     def _build_tic_tab(self) -> QWidget:
-        widget = QWidget()
-        outer  = QHBoxLayout(widget)
+        widget  = QWidget()
+        outer   = QVBoxLayout(widget)
         outer.setContentsMargins(8, 8, 8, 8)
         outer.setSpacing(10)
+        tic_row = QHBoxLayout()
+        tic_row.setSpacing(10)
 
         # ---- Left column: connection + pump control ----
         left = QVBoxLayout()
@@ -2076,7 +2460,7 @@ class FPGAWidget(QWidget):
         left.addWidget(pump_ctrl_grp)
         left.addStretch()
 
-        outer.addLayout(left, 1)
+        tic_row.addLayout(left, 1)
 
         # ---- Right column: gauges + telemetry ----
         right = QVBoxLayout()
@@ -2130,7 +2514,176 @@ class FPGAWidget(QWidget):
         right.addWidget(tel_grp)
         right.addStretch()
 
-        outer.addLayout(right, 1)
+        tic_row.addLayout(right, 1)
+        outer.addLayout(tic_row)
+
+        # ---- Bottom row: valve controls ----
+        valve_row = QHBoxLayout()
+        valve_row.setSpacing(10)
+
+        # ---- Solenoid valve ----
+        sv_grp = QGroupBox("N₂ Solenoid Valve")
+        sg = QVBoxLayout()
+
+        sv_conn_row = QHBoxLayout()
+        sv_conn_row.addWidget(QLabel("Port:"))
+        self._sv_port_edit = QLineEdit("COM5")
+        self._sv_port_edit.setFixedWidth(70)
+        sv_conn_row.addWidget(self._sv_port_edit)
+        self._sv_connect_btn = QPushButton("Connect")
+        self._sv_connect_btn.clicked.connect(self._on_sv_connect)
+        sv_conn_row.addWidget(self._sv_connect_btn)
+        self._sv_disconnect_btn = QPushButton("Disconnect")
+        self._sv_disconnect_btn.setEnabled(False)
+        self._sv_disconnect_btn.clicked.connect(self._on_sv_disconnect)
+        sv_conn_row.addWidget(self._sv_disconnect_btn)
+        sv_conn_row.addStretch()
+        sg.addLayout(sv_conn_row)
+
+        sv_status_row = QHBoxLayout()
+        self._sv_conn_lbl = QLabel("Disconnected")
+        self._sv_conn_lbl.setStyleSheet("color: red; font-weight: bold;")
+        sv_status_row.addWidget(self._sv_conn_lbl)
+        sv_status_row.addStretch()
+        self._sv_state_lbl = QLabel("State: Unknown")
+        self._sv_state_lbl.setFont(QFont("Consolas", 10, QFont.Bold))
+        sv_status_row.addWidget(self._sv_state_lbl)
+        sg.addLayout(sv_status_row)
+
+        sv_btn_row = QHBoxLayout()
+        self._sv_open_btn = QPushButton("Open")
+        self._sv_open_btn.setEnabled(False)
+        self._sv_open_btn.clicked.connect(self._on_sv_open)
+        sv_btn_row.addWidget(self._sv_open_btn)
+        self._sv_close_btn = QPushButton("Close")
+        self._sv_close_btn.setEnabled(False)
+        self._sv_close_btn.clicked.connect(self._on_sv_close)
+        sv_btn_row.addWidget(self._sv_close_btn)
+        sv_btn_row.addStretch()
+        sg.addLayout(sv_btn_row)
+
+        sv_pulse_row = QHBoxLayout()
+        sv_pulse_row.addWidget(QLabel("Pulse:"))
+        self._sv_pulse_spin = QDoubleSpinBox()
+        self._sv_pulse_spin.setRange(0.1, 60.0)
+        self._sv_pulse_spin.setValue(1.0)
+        self._sv_pulse_spin.setSuffix(" s")
+        self._sv_pulse_spin.setDecimals(1)
+        self._sv_pulse_spin.setFixedWidth(80)
+        sv_pulse_row.addWidget(self._sv_pulse_spin)
+        self._sv_pulse_btn = QPushButton("Pulse")
+        self._sv_pulse_btn.setEnabled(False)
+        self._sv_pulse_btn.clicked.connect(self._on_sv_pulse)
+        sv_pulse_row.addWidget(self._sv_pulse_btn)
+        sv_pulse_row.addStretch()
+        sg.addLayout(sv_pulse_row)
+
+        sg.addStretch()
+        sv_grp.setLayout(sg)
+        valve_row.addWidget(sv_grp, 1)
+
+        # ---- Butterfly valve ----
+        bv_grp = QGroupBox("Butterfly Valve (Foreline)")
+        bg = QVBoxLayout()
+
+        bv_conn_row = QHBoxLayout()
+        bv_conn_row.addWidget(QLabel("Port:"))
+        self._bv_port_edit = QLineEdit("COM14")
+        self._bv_port_edit.setFixedWidth(70)
+        bv_conn_row.addWidget(self._bv_port_edit)
+        self._bv_connect_btn = QPushButton("Connect")
+        self._bv_connect_btn.clicked.connect(self._on_bv_connect)
+        bv_conn_row.addWidget(self._bv_connect_btn)
+        self._bv_disconnect_btn = QPushButton("Disconnect")
+        self._bv_disconnect_btn.setEnabled(False)
+        self._bv_disconnect_btn.clicked.connect(self._on_bv_disconnect)
+        bv_conn_row.addWidget(self._bv_disconnect_btn)
+        bv_conn_row.addStretch()
+        bg.addLayout(bv_conn_row)
+
+        bv_status_row = QHBoxLayout()
+        self._bv_conn_lbl = QLabel("Disconnected")
+        self._bv_conn_lbl.setStyleSheet("color: red; font-weight: bold;")
+        bv_status_row.addWidget(self._bv_conn_lbl)
+        bv_status_row.addStretch()
+        self._bv_pos_lbl = QLabel("Position: —°")
+        self._bv_pos_lbl.setFont(QFont("Consolas", 10, QFont.Bold))
+        bv_status_row.addWidget(self._bv_pos_lbl)
+        bg.addLayout(bv_status_row)
+
+        bv_btn_row = QHBoxLayout()
+        self._bv_open_btn = QPushButton("Open (90°)")
+        self._bv_open_btn.setEnabled(False)
+        self._bv_open_btn.clicked.connect(self._on_bv_open)
+        bv_btn_row.addWidget(self._bv_open_btn)
+        self._bv_close_btn = QPushButton("Close (0°)")
+        self._bv_close_btn.setEnabled(False)
+        self._bv_close_btn.clicked.connect(self._on_bv_close)
+        bv_btn_row.addWidget(self._bv_close_btn)
+        self._bv_stop_btn = QPushButton("Stop")
+        self._bv_stop_btn.setEnabled(False)
+        self._bv_stop_btn.clicked.connect(self._on_bv_stop)
+        bv_btn_row.addWidget(self._bv_stop_btn)
+        bv_btn_row.addStretch()
+        bg.addLayout(bv_btn_row)
+
+        bv_angle_row = QHBoxLayout()
+        bv_angle_row.addWidget(QLabel("Set angle:"))
+        self._bv_angle_spin = QDoubleSpinBox()
+        self._bv_angle_spin.setRange(0.0, 90.0)
+        self._bv_angle_spin.setValue(45.0)
+        self._bv_angle_spin.setSuffix("°")
+        self._bv_angle_spin.setDecimals(1)
+        self._bv_angle_spin.setFixedWidth(80)
+        bv_angle_row.addWidget(self._bv_angle_spin)
+        self._bv_set_angle_btn = QPushButton("Set")
+        self._bv_set_angle_btn.setEnabled(False)
+        self._bv_set_angle_btn.clicked.connect(self._on_bv_set_angle)
+        bv_angle_row.addWidget(self._bv_set_angle_btn)
+        bv_angle_row.addStretch()
+        bg.addLayout(bv_angle_row)
+
+        bv_ramp_row = QHBoxLayout()
+        bv_ramp_row.addWidget(QLabel("Ramp to:"))
+        self._bv_ramp_target_spin = QDoubleSpinBox()
+        self._bv_ramp_target_spin.setRange(0.0, 90.0)
+        self._bv_ramp_target_spin.setValue(45.0)
+        self._bv_ramp_target_spin.setSuffix("°")
+        self._bv_ramp_target_spin.setDecimals(1)
+        self._bv_ramp_target_spin.setFixedWidth(80)
+        bv_ramp_row.addWidget(self._bv_ramp_target_spin)
+        bv_ramp_row.addWidget(QLabel("at"))
+        self._bv_ramp_rate_spin = QDoubleSpinBox()
+        self._bv_ramp_rate_spin.setRange(0.1, 90.0)
+        self._bv_ramp_rate_spin.setValue(5.0)
+        self._bv_ramp_rate_spin.setSuffix("°/s")
+        self._bv_ramp_rate_spin.setDecimals(1)
+        self._bv_ramp_rate_spin.setFixedWidth(80)
+        bv_ramp_row.addWidget(self._bv_ramp_rate_spin)
+        self._bv_start_ramp_btn = QPushButton("Start Ramp")
+        self._bv_start_ramp_btn.setEnabled(False)
+        self._bv_start_ramp_btn.clicked.connect(self._on_bv_start_ramp)
+        bv_ramp_row.addWidget(self._bv_start_ramp_btn)
+        self._bv_stop_ramp_btn = QPushButton("Stop Ramp")
+        self._bv_stop_ramp_btn.setEnabled(False)
+        self._bv_stop_ramp_btn.clicked.connect(self._on_bv_stop_ramp)
+        bv_ramp_row.addWidget(self._bv_stop_ramp_btn)
+        bv_ramp_row.addStretch()
+        bg.addLayout(bv_ramp_row)
+
+        bv_home_row = QHBoxLayout()
+        self._bv_home_btn = QPushButton("Home Valve")
+        self._bv_home_btn.setEnabled(False)
+        self._bv_home_btn.clicked.connect(self._on_bv_home)
+        bv_home_row.addWidget(self._bv_home_btn)
+        bv_home_row.addStretch()
+        bg.addLayout(bv_home_row)
+
+        bg.addStretch()
+        bv_grp.setLayout(bg)
+        valve_row.addWidget(bv_grp, 2)
+
+        outer.addLayout(valve_row)
         return widget
 
     # ------------------------------------------------------------------
@@ -2213,6 +2766,7 @@ class FPGAWidget(QWidget):
     def _on_tic_poll_done(self, status: dict) -> None:
         g = status.get("gauges", {})
         p = status.get("pump",   {})
+        self._last_pump_state = dict(p)   # cache for valve safety checks
         self._tic_publisher.update(g.get("wrg_mbar"), g.get("apgx_mbar"))
 
         # Pressure labels with colour coding
@@ -2329,6 +2883,425 @@ class FPGAWidget(QWidget):
         w.start()
 
     # ==================================================================
+    # Solenoid valve — connection
+    # ==================================================================
+
+    def _on_sv_connect(self) -> None:
+        try:
+            from valve_controller import ValveController
+        except ImportError:
+            self._sv_conn_lbl.setText("Library not found")
+            self._sv_conn_lbl.setStyleSheet("color: red; font-weight: bold;")
+            self._append_status("Solenoid valve: valve_controller not importable — check submodule")
+            return
+        port = self._sv_port_edit.text().strip() or None
+        try:
+            self._sv_ctrl = ValveController(port)
+            label = port or "auto"
+            self._sv_conn_lbl.setText(f"Connected ({label})")
+            self._sv_conn_lbl.setStyleSheet("color: green; font-weight: bold;")
+            self._sv_connect_btn.setEnabled(False)
+            self._sv_disconnect_btn.setEnabled(True)
+            self._sv_open_btn.setEnabled(True)
+            self._sv_close_btn.setEnabled(True)
+            self._sv_pulse_btn.setEnabled(True)
+            self._sv_state_lbl.setText("State: Closed")
+            self._append_status(f"Solenoid valve connected ({label})")
+        except Exception as exc:
+            self._sv_ctrl = None
+            self._sv_conn_lbl.setText("Connect failed")
+            self._sv_conn_lbl.setStyleSheet("color: red; font-weight: bold;")
+            self._append_status(f"Solenoid valve connect error: {exc}")
+
+    def _on_sv_disconnect(self) -> None:
+        if self._sv_ctrl is not None:
+            try:
+                self._sv_ctrl.disconnect()
+            except Exception:
+                pass
+            self._sv_ctrl = None
+        self._sv_conn_lbl.setText("Disconnected")
+        self._sv_conn_lbl.setStyleSheet("color: red; font-weight: bold;")
+        self._sv_connect_btn.setEnabled(True)
+        self._sv_disconnect_btn.setEnabled(False)
+        self._sv_open_btn.setEnabled(False)
+        self._sv_close_btn.setEnabled(False)
+        self._sv_pulse_btn.setEnabled(False)
+        self._sv_state_lbl.setText("State: Unknown")
+        self._append_status("Solenoid valve disconnected")
+
+    # ==================================================================
+    # Solenoid valve — safety + actions
+    # ==================================================================
+
+    def _solenoid_safety_check_open(self) -> bool:
+        """Return True if opening the solenoid is safe (blocking) or user confirms (warning)."""
+        p = self._last_pump_state
+        running   = p.get("running",   False)
+        speed_pct = p.get("speed_pct")
+
+        # Hard block: pump is running or accelerating
+        if running:
+            QMessageBox.critical(self, "Solenoid Blocked",
+                "Cannot open solenoid: the turbo pump is running.\n\n"
+                "Stop the pump and wait for it to fully spin down before "
+                "opening the N₂ inlet.")
+            return False
+
+        # Hard block: spinning down above 50 %
+        if speed_pct is not None and speed_pct > 50:
+            QMessageBox.critical(self, "Solenoid Blocked",
+                f"Cannot open solenoid: turbo is still spinning at {speed_pct:.0f} %.\n\n"
+                "Wait until the speed drops below 50 % before opening the N₂ inlet.")
+            return False
+
+        # Soft warn: spinning down ≤ 50 %
+        if speed_pct is not None and speed_pct > 0:
+            ret = QMessageBox.question(self, "Solenoid Warning",
+                f"Turbo is spinning down at {speed_pct:.0f} %.\n"
+                "Opening the N₂ inlet now may stress the pump bearings.\n\n"
+                "Proceed anyway?",
+                QMessageBox.Yes | QMessageBox.No, QMessageBox.No)
+            if ret != QMessageBox.Yes:
+                return False
+
+        # Soft warn: butterfly valve not fully closed
+        if self._bv_position is not None and self._bv_position > 5.0:
+            ret = QMessageBox.question(self, "Solenoid Warning",
+                f"Butterfly valve is at {self._bv_position:.1f}° (not fully closed).\n"
+                "Opening the solenoid with the butterfly open will vent N₂ into the system.\n\n"
+                "Proceed anyway?",
+                QMessageBox.Yes | QMessageBox.No, QMessageBox.No)
+            if ret != QMessageBox.Yes:
+                return False
+
+        return True
+
+    def _on_sv_open(self) -> None:
+        if self._sv_ctrl is None:
+            return
+        if not self._solenoid_safety_check_open():
+            return
+
+        class _W(QThread):
+            done = pyqtSignal(bool, str)
+            def __init__(self, ctrl): super().__init__(); self._c = ctrl
+            def run(self):
+                try:
+                    self._c.open()
+                    self.done.emit(True, "Solenoid opened")
+                except Exception as exc:
+                    self.done.emit(False, f"Solenoid open error: {exc}")
+
+        w = _W(self._sv_ctrl)
+        w.done.connect(lambda ok, msg: (
+            self._append_status(f"Solenoid: {msg}"),
+            self._sv_state_lbl.setText("State: Open" if ok else "State: Error"),
+        ))
+        self._valve_cmd_workers.append(w)
+        w.finished.connect(lambda: self._valve_cmd_workers.remove(w)
+                           if w in self._valve_cmd_workers else None)
+        w.start()
+
+    def _on_sv_close(self) -> None:
+        if self._sv_ctrl is None:
+            return
+
+        class _W(QThread):
+            done = pyqtSignal(bool, str)
+            def __init__(self, ctrl): super().__init__(); self._c = ctrl
+            def run(self):
+                try:
+                    self._c.close()
+                    self.done.emit(True, "Solenoid closed")
+                except Exception as exc:
+                    self.done.emit(False, f"Solenoid close error: {exc}")
+
+        w = _W(self._sv_ctrl)
+        w.done.connect(lambda ok, msg: (
+            self._append_status(f"Solenoid: {msg}"),
+            self._sv_state_lbl.setText("State: Closed" if ok else "State: Error"),
+        ))
+        self._valve_cmd_workers.append(w)
+        w.finished.connect(lambda: self._valve_cmd_workers.remove(w)
+                           if w in self._valve_cmd_workers else None)
+        w.start()
+
+    def _on_sv_pulse(self) -> None:
+        if self._sv_ctrl is None:
+            return
+        if not self._solenoid_safety_check_open():
+            return
+        duration = self._sv_pulse_spin.value()
+
+        class _W(QThread):
+            done = pyqtSignal(bool, str)
+            def __init__(self, ctrl, dur): super().__init__(); self._c = ctrl; self._d = dur
+            def run(self):
+                try:
+                    self._c.pulse(self._d)
+                    self.done.emit(True, f"Solenoid pulsed {self._d:.1f} s")
+                except Exception as exc:
+                    self.done.emit(False, f"Solenoid pulse error: {exc}")
+
+        w = _W(self._sv_ctrl, duration)
+        w.done.connect(lambda ok, msg: (
+            self._append_status(f"Solenoid: {msg}"),
+            self._sv_state_lbl.setText("State: Closed" if ok else "State: Error"),
+        ))
+        self._valve_cmd_workers.append(w)
+        w.finished.connect(lambda: self._valve_cmd_workers.remove(w)
+                           if w in self._valve_cmd_workers else None)
+        w.start()
+
+    # ==================================================================
+    # Butterfly valve — connection
+    # ==================================================================
+
+    def _on_bv_connect(self) -> None:
+        try:
+            from cv_controller import CommandValveController
+        except ImportError:
+            self._bv_conn_lbl.setText("Library not found")
+            self._bv_conn_lbl.setStyleSheet("color: red; font-weight: bold;")
+            self._append_status("Butterfly valve: cv_controller not importable — check submodule")
+            return
+        port = self._bv_port_edit.text().strip() or "COM14"
+        try:
+            cv = CommandValveController(port)
+            if not cv.connect():
+                raise RuntimeError("connect() returned False")
+            self._bv_ctrl = cv
+            self._bv_conn_lbl.setText(f"Connected ({port})")
+            self._bv_conn_lbl.setStyleSheet("color: green; font-weight: bold;")
+            self._bv_connect_btn.setEnabled(False)
+            self._bv_disconnect_btn.setEnabled(True)
+            for btn in (self._bv_open_btn, self._bv_close_btn, self._bv_stop_btn,
+                        self._bv_set_angle_btn, self._bv_start_ramp_btn, self._bv_home_btn):
+                btn.setEnabled(True)
+            pos = cv.get_position()
+            if pos is not None:
+                self._bv_position = pos
+                self._bv_pos_lbl.setText(f"Position: {pos:.1f}°")
+            self._append_status(f"Butterfly valve connected ({port})")
+        except Exception as exc:
+            self._bv_ctrl = None
+            self._bv_conn_lbl.setText("Connect failed")
+            self._bv_conn_lbl.setStyleSheet("color: red; font-weight: bold;")
+            self._append_status(f"Butterfly valve connect error: {exc}")
+
+    def _on_bv_disconnect(self) -> None:
+        if self._bv_ramp_stop is not None:
+            self._bv_ramp_stop.set()
+            self._bv_ramp_stop = None
+        if self._bv_ctrl is not None:
+            try:
+                self._bv_ctrl.disconnect()
+            except Exception:
+                pass
+            self._bv_ctrl = None
+        self._bv_position = None
+        self._bv_conn_lbl.setText("Disconnected")
+        self._bv_conn_lbl.setStyleSheet("color: red; font-weight: bold;")
+        self._bv_connect_btn.setEnabled(True)
+        self._bv_disconnect_btn.setEnabled(False)
+        for btn in (self._bv_open_btn, self._bv_close_btn, self._bv_stop_btn,
+                    self._bv_set_angle_btn, self._bv_start_ramp_btn,
+                    self._bv_stop_ramp_btn, self._bv_home_btn):
+            btn.setEnabled(False)
+        self._bv_pos_lbl.setText("Position: —°")
+        self._append_status("Butterfly valve disconnected")
+
+    # ==================================================================
+    # Butterfly valve — safety + actions
+    # ==================================================================
+
+    def _butterfly_safety_check_close(self) -> bool:
+        """Warn and ask user to confirm if the turbo is running before closing butterfly."""
+        if self._last_pump_state.get("running", False):
+            ret = QMessageBox.question(self, "Butterfly Valve Warning",
+                "The turbo pump is running.\n"
+                "Closing the butterfly valve will throttle the foreline and stress the pump.\n\n"
+                "Proceed anyway?",
+                QMessageBox.Yes | QMessageBox.No, QMessageBox.No)
+            return ret == QMessageBox.Yes
+        return True
+
+    def _bv_update_position(self, pos: float) -> None:
+        self._bv_position = pos
+        self._bv_pos_lbl.setText(f"Position: {pos:.1f}°")
+
+    def _on_bv_open(self) -> None:
+        if self._bv_ctrl is None:
+            return
+
+        class _W(QThread):
+            done = pyqtSignal(bool, str, float)
+            def __init__(self, ctrl): super().__init__(); self._c = ctrl
+            def run(self):
+                try:
+                    ok  = self._c.open()
+                    pos = self._c.get_position() or 90.0
+                    self.done.emit(ok, "Butterfly opened" if ok else "Open failed", pos)
+                except Exception as exc:
+                    self.done.emit(False, f"BV open error: {exc}", 0.0)
+
+        w = _W(self._bv_ctrl)
+        w.done.connect(lambda ok, msg, pos: (
+            self._append_status(f"Butterfly: {msg}"),
+            self._bv_update_position(pos),
+        ))
+        self._valve_cmd_workers.append(w)
+        w.finished.connect(lambda: self._valve_cmd_workers.remove(w)
+                           if w in self._valve_cmd_workers else None)
+        w.start()
+
+    def _on_bv_close(self) -> None:
+        if self._bv_ctrl is None:
+            return
+        if not self._butterfly_safety_check_close():
+            return
+
+        class _W(QThread):
+            done = pyqtSignal(bool, str, float)
+            def __init__(self, ctrl): super().__init__(); self._c = ctrl
+            def run(self):
+                try:
+                    ok  = self._c.close()
+                    pos = self._c.get_position() or 0.0
+                    self.done.emit(ok, "Butterfly closed" if ok else "Close failed", pos)
+                except Exception as exc:
+                    self.done.emit(False, f"BV close error: {exc}", 0.0)
+
+        w = _W(self._bv_ctrl)
+        w.done.connect(lambda ok, msg, pos: (
+            self._append_status(f"Butterfly: {msg}"),
+            self._bv_update_position(pos),
+        ))
+        self._valve_cmd_workers.append(w)
+        w.finished.connect(lambda: self._valve_cmd_workers.remove(w)
+                           if w in self._valve_cmd_workers else None)
+        w.start()
+
+    def _on_bv_stop(self) -> None:
+        if self._bv_ctrl is None:
+            return
+
+        class _W(QThread):
+            done = pyqtSignal(bool, str, float)
+            def __init__(self, ctrl): super().__init__(); self._c = ctrl
+            def run(self):
+                try:
+                    ok  = self._c.stop()
+                    pos = self._c.get_position() or 0.0
+                    self.done.emit(ok, "Butterfly stopped" if ok else "Stop failed", pos)
+                except Exception as exc:
+                    self.done.emit(False, f"BV stop error: {exc}", 0.0)
+
+        w = _W(self._bv_ctrl)
+        w.done.connect(lambda ok, msg, pos: (
+            self._append_status(f"Butterfly: {msg}"),
+            self._bv_update_position(pos),
+        ))
+        self._valve_cmd_workers.append(w)
+        w.finished.connect(lambda: self._valve_cmd_workers.remove(w)
+                           if w in self._valve_cmd_workers else None)
+        w.start()
+
+    def _on_bv_set_angle(self) -> None:
+        if self._bv_ctrl is None:
+            return
+        angle = self._bv_angle_spin.value()
+
+        class _W(QThread):
+            done = pyqtSignal(bool, str, float)
+            def __init__(self, ctrl, a): super().__init__(); self._c = ctrl; self._a = a
+            def run(self):
+                try:
+                    ok  = self._c.set_angle(self._a)
+                    pos = self._c.get_position() or self._a
+                    self.done.emit(ok, f"Butterfly → {self._a:.1f}°" if ok else "Set angle failed", pos)
+                except Exception as exc:
+                    self.done.emit(False, f"BV set angle error: {exc}", 0.0)
+
+        w = _W(self._bv_ctrl, angle)
+        w.done.connect(lambda ok, msg, pos: (
+            self._append_status(f"Butterfly: {msg}"),
+            self._bv_update_position(pos),
+        ))
+        self._valve_cmd_workers.append(w)
+        w.finished.connect(lambda: self._valve_cmd_workers.remove(w)
+                           if w in self._valve_cmd_workers else None)
+        w.start()
+
+    def _on_bv_start_ramp(self) -> None:
+        if self._bv_ctrl is None:
+            return
+        if self._bv_ramp_stop is not None:
+            self._append_status("Butterfly: ramp already in progress — stop it first")
+            return
+        target   = self._bv_ramp_target_spin.value()
+        rate     = self._bv_ramp_rate_spin.value()
+        stop_evt = threading.Event()
+        self._bv_ramp_stop = stop_evt
+
+        class _W(QThread):
+            done   = pyqtSignal(bool, str)
+            update = pyqtSignal(float)
+            def __init__(self, ctrl, t, r, ev):
+                super().__init__()
+                self._c, self._t, self._r, self._ev = ctrl, t, r, ev
+            def run(self):
+                ok = self._c.ramp_to_angle(
+                    self._t, self._r, self._ev,
+                    on_update=lambda a: self.update.emit(a))
+                self.done.emit(ok,
+                    f"Ramp complete — reached {self._t:.1f}°" if ok else "Ramp cancelled")
+
+        w = _W(self._bv_ctrl, target, rate, stop_evt)
+        w.update.connect(self._bv_update_position)
+        w.done.connect(lambda ok, msg: (
+            self._append_status(f"Butterfly: {msg}"),
+            setattr(self, "_bv_ramp_stop", None),
+            self._bv_stop_ramp_btn.setEnabled(False),
+        ))
+        self._bv_stop_ramp_btn.setEnabled(True)
+        self._valve_cmd_workers.append(w)
+        w.finished.connect(lambda: self._valve_cmd_workers.remove(w)
+                           if w in self._valve_cmd_workers else None)
+        w.start()
+
+    def _on_bv_stop_ramp(self) -> None:
+        if self._bv_ramp_stop is not None:
+            self._bv_ramp_stop.set()
+
+    def _on_bv_home(self) -> None:
+        if self._bv_ctrl is None:
+            return
+
+        class _W(QThread):
+            done = pyqtSignal(bool, str, float)
+            def __init__(self, ctrl): super().__init__(); self._c = ctrl
+            def run(self):
+                try:
+                    ok  = self._c.home()
+                    pos = self._c.get_position() or 0.0
+                    self.done.emit(ok,
+                        "Butterfly homed" if ok else "Homing failed — check error code", pos)
+                except Exception as exc:
+                    self.done.emit(False, f"BV home error: {exc}", 0.0)
+
+        w = _W(self._bv_ctrl)
+        w.done.connect(lambda ok, msg, pos: (
+            self._append_status(f"Butterfly: {msg}"),
+            self._bv_update_position(pos),
+        ))
+        self._valve_cmd_workers.append(w)
+        w.finished.connect(lambda: self._valve_cmd_workers.remove(w)
+                           if w in self._valve_cmd_workers else None)
+        w.start()
+
+    # ==================================================================
     # Cleanup
     # ==================================================================
 
@@ -2336,6 +3309,18 @@ class FPGAWidget(QWidget):
         self._tic_timer.stop()
         if self._tic_ctrl is not None:
             self._tic_ctrl.disconnect()
+        if self._bv_ramp_stop is not None:
+            self._bv_ramp_stop.set()
+        if self._bv_ctrl is not None:
+            try:
+                self._bv_ctrl.disconnect()
+            except Exception:
+                pass
+        if self._sv_ctrl is not None:
+            try:
+                self._sv_ctrl.disconnect()
+            except Exception:
+                pass
         self._proc_manager.teardown_all()
         self._ctrl.disconnect()
         super().closeEvent(event)

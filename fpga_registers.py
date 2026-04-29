@@ -61,7 +61,7 @@ REGISTERS: list[RegisterDef] = [
     # --- Status / timing ---
     RegisterDef("Stop",                   Category.STATUS, Access.RW, is_bool=True, description="Stop FPGA loop"),
     RegisterDef("FPGA Error Out",         Category.STATUS, Access.READ, description="Error indicator from FPGA"),
-    RegisterDef("Count(uSec)",            Category.STATUS, Access.READ, is_integer=True, description="Microsecond tick counter"),
+    RegisterDef("Count(uSec)",            Category.STATUS, Access.RW,   is_integer=True, description="Microsecond tick counter (sets loop period; 10 = 100 kHz)"),
 
     # --- Z axis ---
     # Setpoints, gains, offsets, limits: I32 in LabVIEW VI (integer writes required)

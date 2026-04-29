@@ -234,9 +234,9 @@ class FPGAPlotWidget(QWidget):
     a QTimer redraws at ~60 fps by updating curve data in-place.
     """
 
-    HISTORY_SEC = 5.0     # visible window
-    BUF_CAPACITY = 5000   # ring-buffer size (enough for 5 s @ 1 kHz)
-    REFRESH_MS = 16       # ~60 fps redraw timer
+    HISTORY_SEC = 10.0    # visible window (seconds)
+    BUF_CAPACITY = 20000  # ring-buffer size (10 s @ 2 kHz)
+    REFRESH_MS = 33       # ~30 fps redraw timer (less GPU contention)
 
     def __init__(self, parent=None):
         super().__init__(parent)
