@@ -1418,9 +1418,6 @@ class FPGAWidget(QWidget):
             pi.showAxis("top")
             pi.getAxis("top").setLabel("Time")
             self._wd_plot_curve = pi.plot(pen=pg.mkPen("#2563eb", width=1.5))
-            self._wd_annot = pg.TextItem(anchor=(0, 1), color=(80, 80, 80))
-            self._wd_annot.setZValue(10)
-            pi.addItem(self._wd_annot)
             layout.addWidget(self._wd_plot_widget)
             self._wd_has_plot = True
         except ImportError:
@@ -2388,41 +2385,6 @@ class FPGAWidget(QWidget):
         x = np.arange(len(int_samples))
         self._wd_plot_curve.setData(x, int_samples)
         self._wd_update_top_axis(n_points, sample_rate)
-
-        # Annotation: f and Vpp in physical units
-        try:
-            tab_idx = self._wd_type_tabs.currentIndex()
-            if tab_idx == 0:
-                n_cyc = self._wd_sine_ncycles.value()
-            elif tab_idx == 1:
-                n_cyc = self._wd_tri_ncycles.value()
-            elif tab_idx == 2:
-                n_cyc = self._wd_trap_ncycles.value()
-            else:
-                n_cyc = 1
-            freq_hz = sample_rate * n_cyc / n_points if n_points > 0 else 0
-            if freq_hz >= 1e6:
-                freq_str = f"{freq_hz / 1e6:.4f} MHz"
-            elif freq_hz >= 1e3:
-                freq_str = f"{freq_hz / 1e3:.3f} kHz"
-            else:
-                freq_str = f"{freq_hz:.3f} Hz"
-
-            cal_cts = float(self._wd_volt_cal_counts.text() or "2047")
-            cal_v   = float(self._wd_volt_cal_v.text() or "10")
-            amp_cts = self._wd_amplitude_spin.value()
-            dc_cts  = self._wd_dc_spin.value()
-            vpp_v   = (amp_cts * 2 * cal_v / cal_cts) if cal_cts != 0 else 0
-            dc_v    = (dc_cts * cal_v / cal_cts) if cal_cts != 0 else 0
-            ann = (f"f = {freq_str}   "
-                   f"Vpp = {vpp_v:.3f} V ({amp_cts * 2} cts)   "
-                   f"DC = {dc_v:.3f} V ({dc_cts} cts)")
-            self._wd_annot.setText(ann)
-            pi = self._wd_plot_widget.getPlotItem()
-            vr = pi.viewRange()
-            self._wd_annot.setPos(vr[0][0], vr[1][1])
-        except Exception:
-            pass
 
     def _on_wd_save(self) -> None:
         """Write all active columns to a single integer CSV (no header)."""
