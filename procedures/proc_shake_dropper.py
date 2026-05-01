@@ -334,11 +334,12 @@ class ShakeDropperWidget(QWidget):
         self._shake_worker: _ShakeWorker | None = None
         self._awg_connected = False
         self._psu_connected = False
-        self._shaking       = False
-        self._shake_logger  = ShakeEventLogger()
-        self._last_step     = 0
-        self._last_voltage  = 0.0
-        self._shake_event_cb = None   # set by trapping panel via set_shake_event_callback
+        self._shaking        = False
+        self._shake_logger   = ShakeEventLogger()
+        self._last_step      = 0
+        self._last_voltage   = 0.0
+        self._active_n_steps = 0    # actual steps in current run (may differ from spinbox for resume)
+        self._shake_event_cb = None  # set by trapping panel via set_shake_event_callback
 
         self._build_ui()
         self._load_last_session()
@@ -570,6 +571,20 @@ class ShakeDropperWidget(QWidget):
         self._stop_btn.clicked.connect(self._on_stop)
         btn_row.addWidget(self._stop_btn)
 
+        self._resume_btn = QPushButton("⏩  Resume")
+        self._resume_btn.setFixedHeight(38)
+        self._resume_btn.setMinimumWidth(130)
+        self._resume_btn.setStyleSheet(
+            "QPushButton { background-color: #d97706; color: white; "
+            "font-size: 13px; font-weight: bold; border-radius: 4px; }"
+            "QPushButton:hover { background-color: #f59e0b; }"
+            "QPushButton:disabled { background-color: #d1d5db; color: #9ca3af; }"
+        )
+        self._resume_btn.setEnabled(False)
+        self._resume_btn.setToolTip("Resume from last session's voltage and step")
+        self._resume_btn.clicked.connect(self._on_resume)
+        btn_row.addWidget(self._resume_btn)
+
         btn_row.addStretch()
         l.addLayout(btn_row)
 
@@ -690,9 +705,11 @@ class ShakeDropperWidget(QWidget):
         self._computed_max_lbl.setText(f"{capped:.2f} V")
 
     def _update_start_btn(self) -> None:
-        self._start_btn.setEnabled(
-            self._awg_connected and self._psu_connected and not self._shaking
-        )
+        can_run = self._awg_connected and self._psu_connected and not self._shaking
+        self._start_btn.setEnabled(can_run)
+        state = _load_state()
+        remaining = max(0, state.get("last_total_steps", 0) - state.get("last_step", 0))
+        self._resume_btn.setEnabled(can_run and remaining > 0)
 
     def _set_param_widgets_enabled(self, enabled: bool) -> None:
         for w in (
@@ -848,47 +865,63 @@ class ShakeDropperWidget(QWidget):
     # ------------------------------------------------------------------
 
     def _on_start(self) -> None:
+        self._start_internal(
+            start_v=self._start_v_spin.value(),
+            n_steps=self._n_steps_spin.value(),
+            label="Shaking started",
+        )
+
+    def _on_resume(self) -> None:
+        state = _load_state()
+        remaining = max(0, state.get("last_total_steps", 0) - state.get("last_step", 0))
+        if remaining == 0:
+            return
+        last_v = float(state.get("last_voltage_v", self._start_v_spin.value()))
+        self._start_internal(start_v=last_v, n_steps=remaining, label="Resumed")
+
+    def _start_internal(self, start_v: float, n_steps: int,
+                        label: str = "Shaking started") -> None:
         if not (self._awg_connected and self._psu_connected):
             return
 
         awg_cfg = self._awg_config()
         psu_cfg = self._psu_config()
 
-        n      = self._n_steps_spin.value()
-        start  = self._start_v_spin.value()
-        step   = self._step_v_spin.value()
-        max_v  = self._max_v_spin.value()
-        dwell  = self._dwell_spin.value()
-        ch     = self._channel_spin.value()
+        step  = self._step_v_spin.value()
+        max_v = self._max_v_spin.value()
+        dwell = self._dwell_spin.value()
+        ch    = self._channel_spin.value()
 
-        self._shaking = True
-        self._last_step    = 0
-        self._last_voltage = start
+        self._shaking        = True
+        self._active_n_steps = n_steps
+        self._last_step      = 0
+        self._last_voltage   = start_v
         self._start_btn.setEnabled(False)
+        self._resume_btn.setEnabled(False)
         self._stop_btn.setEnabled(True)
         self._psu_output_btn.setEnabled(False)
         self._set_param_widgets_enabled(False)
         self._progress_bar.setValue(0)
-        self._step_lbl.setText(f"0 / {n}")
-        self._volt_lbl.setText(f"{start:.2f} V")
+        self._step_lbl.setText(f"0 / {n_steps}")
+        self._volt_lbl.setText(f"{start_v:.2f} V")
         self._elapsed_lbl.setText("0.0 s")
 
         if self._shake_event_cb:
             self._shake_event_cb("start")
-        self._shake_logger.start(amplitude_vpp=start, step=0)
-        total_s = n * (awg_cfg["sweep_time_s"] + dwell)
+        self._shake_logger.start(amplitude_vpp=start_v, step=0)
+        total_s = n_steps * (awg_cfg["sweep_time_s"] + dwell)
         self._log(
-            f"Shaking started: {n} steps, "
-            f"{start:.2f}–{min(start + n*step, max_v):.2f} V (step {step:.2f} V), "
-            f"{dwell:.1f} s dwell  (~{total_s:.0f} s total)"
+            f"{label}: {n_steps} steps, "
+            f"{start_v:.2f}–{min(start_v + n_steps * step, max_v):.2f} V "
+            f"(step {step:.2f} V), {dwell:.1f} s dwell  (~{total_s:.0f} s total)"
         )
 
         shake_worker = _ShakeWorker(
             awg_config   = awg_cfg,
             psu_config   = psu_cfg,
             ch           = ch,
-            n_steps      = n,
-            start_v      = start,
+            n_steps      = n_steps,
+            start_v      = start_v,
             step_v       = step,
             max_v        = max_v,
             dwell_s      = dwell,
@@ -910,7 +943,7 @@ class ShakeDropperWidget(QWidget):
     def _on_step_update(self, step_n: int, voltage_v: float, elapsed_s: float) -> None:
         if self._shake_event_cb:
             self._shake_event_cb("step")
-        n = self._n_steps_spin.value()
+        n = self._active_n_steps or self._n_steps_spin.value()
         self._step_lbl.setText(f"{step_n} / {n}")
         self._volt_lbl.setText(f"{voltage_v:.2f} V")
         self._elapsed_lbl.setText(f"{elapsed_s:.1f} s")
@@ -975,25 +1008,40 @@ class ShakeDropperWidget(QWidget):
     # ------------------------------------------------------------------
 
     def set_shake_event_callback(self, fn) -> None:
-        """Register a callable(event_type) called on 'start', 'step', 'done'."""
+        """Register a callable(event_type) called on 'start', 'sweep_start', 'step', 'done'."""
         self._shake_event_cb = fn
 
     def request_stop(self) -> None:
         """Stop shaking (safe to call on the main thread)."""
         self._on_stop()
 
+    def is_shaking(self) -> bool:
+        return self._shaking
+
     def start_shaking_public(self, start_v: float, step_v: float,
                              n_steps: int, dwell_s: float,
                              max_v: float) -> bool:
-        """Start shaking with given params. Returns False if not connected."""
-        if not (self._awg_connected and self._psu_connected):
+        """Start shaking with given params. Returns False if not connected or already shaking."""
+        if not (self._awg_connected and self._psu_connected) or self._shaking:
             return False
         self._start_v_spin.setValue(start_v)
         self._step_v_spin.setValue(step_v)
         self._n_steps_spin.setValue(n_steps)
         self._dwell_spin.setValue(dwell_s)
         self._max_v_spin.setValue(max_v)
-        self._on_start()
+        self._start_internal(start_v=start_v, n_steps=n_steps)
+        return True
+
+    def resume_shaking_public(self) -> bool:
+        """Resume from last session state. Returns False if nothing to resume or not connected."""
+        if not (self._awg_connected and self._psu_connected) or self._shaking:
+            return False
+        state = _load_state()
+        remaining = max(0, state.get("last_total_steps", 0) - state.get("last_step", 0))
+        if remaining == 0:
+            return False
+        last_v = float(state.get("last_voltage_v", self._start_v_spin.value()))
+        self._start_internal(start_v=last_v, n_steps=remaining, label="Resumed")
         return True
 
     # ------------------------------------------------------------------

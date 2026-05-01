@@ -7,9 +7,10 @@ Sections
 --------
   Dropper Stage shortcuts   — preset positions + move buttons
   Shake Dropper shortcuts   — ramp params, Start/Stop, Auto-catch checkbox
-  Sphere Detection          — sliding-window RMS for X, Y, Z; veto LED
+  Sphere Detection          — Catching / Trapping / Lock thresholds with LEDs
   Feedback Presets          — Prepare Trap / Start Feedback column grid
   Lower Sphere              — DC offset ramp with auto-freeze at trap centre
+  Trapping Macros           — Trap Sphere, Continue Trapping, Release Sphere
 
 Data flow
 ---------
@@ -38,6 +39,7 @@ from PyQt5.QtCore import Qt, QTimer, pyqtSignal
 from PyQt5.QtWidgets import (
     QCheckBox,
     QDoubleSpinBox,
+    QFrame,
     QGridLayout,
     QGroupBox,
     QHBoxLayout,
@@ -56,6 +58,7 @@ from procedures.base import ControlProcedure
 # ---------------------------------------------------------------------------
 
 PRESET_FIELDS = [
+    ("Z Setpoint",  "Z Setpoint",  True),
     ("dg X",        "dg X",        False),
     ("dg Y",        "dg Y",        False),
     ("dg Z",        "dg Z",        False),
@@ -68,12 +71,27 @@ _LED_OFF  = "background-color: #d1d5db; border-radius: 9px; border: 1px solid #9
 _LED_ON   = "background-color: #22c55e; border-radius: 9px; border: 1px solid #16a34a;"
 _LED_VETO = "background-color: #f59e0b; border-radius: 9px; border: 1px solid #d97706;"
 
+# Macro states
+_ST_IDLE       = 0
+_ST_SHAKING    = 1   # shaker running, waiting for catch thresholds
+_ST_RETRACTING = 2   # dropper retracting, waiting retract_delay before checking trap
+_ST_TRAPPING   = 3   # checking trapping thresholds (above = sphere present)
+_ST_LOWERING   = 4   # sphere trapped, lower sphere running
+_ST_LOCKED     = 5   # sphere locked at trap centre
+
 
 def _led() -> QLabel:
     w = QLabel()
     w.setFixedSize(18, 18)
     w.setStyleSheet(_LED_OFF)
     return w
+
+
+def _hsep() -> QFrame:
+    f = QFrame()
+    f.setFrameShape(QFrame.HLine)
+    f.setStyleSheet("color: #e5e7eb;")
+    return f
 
 
 # ---------------------------------------------------------------------------
@@ -98,40 +116,64 @@ class TrappingPanel(QWidget):
         self._y_buf: collections.deque = collections.deque()
         self._z_buf: collections.deque = collections.deque()
 
-        # Pre-computed values (written by _on_fast_data_ui, read by lower timer)
+        # Pre-computed RMS / mean (written by _on_fast_data_ui, read by timers)
+        self._x_rms:  float = 0.0
+        self._y_rms:  float = 0.0
         self._z_mean: float = 0.0
         self._z_rms:  float = 0.0
 
-        # Detection state
+        # Detection state — catching thresholds (during shaking)
         self._x_detected: bool = False
         self._y_detected: bool = False
         self._z_detected: bool = False
 
+        # Detection state — trapping thresholds (after retraction; RMS above = sphere present)
+        self._x_trapped: bool = False
+        self._y_trapped: bool = False
+
+        # Detection state — lock thresholds (RMS below = sphere stable)
+        self._x_locked: bool = False
+        self._y_locked: bool = False
+        self._z_locked: bool = False
+
         # Veto state
-        self._shaking:    bool  = False  # True from "start" callback to "done" callback
-        self._veto_until: float = 0.0   # monotonic time for post-shake tail
+        self._shaking:    bool  = False
+        self._veto_until: float = 0.0
 
         # Lower-sphere state
         self._lowering:   bool  = False
         self._current_dc: float = 0.0
 
+        # Macro state machine
+        self._macro_state:      int   = _ST_IDLE
+        self._macro_first_run:  bool  = True   # newbie token
+        self._macro_caught:     bool  = False
+        self._macro_trapped:    bool  = False
+        self._macro_locked_f:   bool  = False
+        self._macro_retract_t:  float = 0.0    # when retraction started
+        self._macro_trap_t:     float = 0.0    # when TRAPPING state was entered
+
         # Preset spinbox registry
         self._preset_spins: dict = {"prepare": {}, "feedback": {}}
         self._preset_regs:  dict = {name: reg for name, reg, _ in PRESET_FIELDS}
-        self._preset_readback_lbls: dict = {}   # field → col-3 "Current FPGA" label
-        self._dc_offset_fb_lbl = None           # col-2 DC offset Z label (no spinbox)
-        self._z_setpoint_hint_lbl = None        # gray hint next to Z setpoint spinbox
-        self._lower_dc_offset_lbl = None        # DC offset readback in lower-sphere row
+        self._preset_readback_lbls: dict = {}
+        self._dc_offset_fb_lbl     = None
+        self._z_setpoint_hint_lbl  = None
+        self._lower_dc_offset_lbl  = None
 
         # Lower-sphere timer (main thread)
         self._lower_timer = QTimer(self)
         self._lower_timer.timeout.connect(self._on_lower_timer)
 
+        # Macro polling timer (250 ms, main thread)
+        self._macro_timer = QTimer(self)
+        self._macro_timer.timeout.connect(self._on_macro_tick)
+
         self._build_ui()
         self._fast_data_signal.connect(self._on_fast_data_ui)
 
     # ------------------------------------------------------------------
-    # Instrument wiring (called from Procedure.set_instruments)
+    # Instrument wiring
     # ------------------------------------------------------------------
 
     def set_instruments(self, dropper_widget, shaker_widget) -> None:
@@ -144,7 +186,7 @@ class TrappingPanel(QWidget):
     # ------------------------------------------------------------------
 
     def on_fast_data(self, values: dict) -> None:
-        """Thread-safe: call from any thread (e.g. monitor thread via fpga_gui)."""
+        """Thread-safe: call from any thread."""
         self._fast_data_signal.emit(values)
 
     # ------------------------------------------------------------------
@@ -166,6 +208,7 @@ class TrappingPanel(QWidget):
         layout.addWidget(self._build_detection_group())
         layout.addWidget(self._build_presets_group())
         layout.addWidget(self._build_lower_sphere_group())
+        layout.addWidget(self._build_macro_group())
         layout.addStretch()
 
         scroll.setWidget(container)
@@ -282,65 +325,152 @@ class TrappingPanel(QWidget):
 
         return grp
 
-    # ---- Sphere detection ----
+    # ---- Sphere detection — two-column layout ----
 
     def _build_detection_group(self) -> QGroupBox:
         grp = QGroupBox("Sphere Detection")
-        gl = QVBoxLayout(grp)
+        outer = QHBoxLayout(grp)
+        outer.setSpacing(10)
 
-        def _ch_row(axis: str, default_thresh: float, decimals: int,
-                    thresh_width: int = 90):
+        # ── Left column: Catching Thresholds ──────────────────────────
+        catch_box = QGroupBox("Catching Thresholds")
+        catch_box.setStyleSheet("QGroupBox { font-weight: bold; }")
+        cl = QVBoxLayout(catch_box)
+        cl.setSpacing(5)
+
+        hint_c = QLabel("RMS above threshold during shaking → sphere on dropper")
+        hint_c.setStyleSheet("color: #6b7280; font-size: 10px;")
+        hint_c.setWordWrap(True)
+        cl.addWidget(hint_c)
+
+        for axis, thresh_attr, rms_attr, led_attr, default, dec in [
+            ("X", "_x_thresh_spin", "_x_rms_lbl", "_x_led", 0.05,  4),
+            ("Y", "_y_thresh_spin", "_y_rms_lbl", "_y_led", 0.05,  4),
+            ("Z", "_z_thresh_spin", "_z_rms_lbl", "_z_led", 100.0, 1),
+        ]:
             row = QHBoxLayout()
-            row.addWidget(QLabel(f"{axis} RMS thresh:"))
-            thresh = QDoubleSpinBox()
-            thresh.setRange(0.0, 1e7)
-            thresh.setValue(default_thresh)
-            thresh.setDecimals(decimals)
-            thresh.setFixedWidth(thresh_width)
-            row.addWidget(thresh)
-            row.addSpacing(6)
-            row.addWidget(QLabel("Current:"))
-            rms_lbl = QLabel("—")
-            rms_lbl.setFixedWidth(80)
-            rms_lbl.setStyleSheet("color: #6b7280;")
-            row.addWidget(rms_lbl)
+            row.addWidget(QLabel(f"{axis} thresh:"))
+            sp = QDoubleSpinBox()
+            sp.setRange(0.0, 1e7)
+            sp.setValue(default)
+            sp.setDecimals(dec)
+            sp.setFixedWidth(88)
+            setattr(self, thresh_attr, sp)
+            row.addWidget(sp)
+            row.addWidget(QLabel("RMS:"))
+            lbl = QLabel("—")
+            lbl.setFixedWidth(68)
+            lbl.setStyleSheet("color: #6b7280;")
+            setattr(self, rms_attr, lbl)
+            row.addWidget(lbl)
             led = _led()
+            setattr(self, led_attr, led)
             row.addWidget(led)
-            row.addWidget(QLabel(f"{axis} detected"))
+            row.addWidget(QLabel(f"{axis}"))
             row.addStretch()
-            gl.addLayout(row)
-            return thresh, rms_lbl, led
+            cl.addLayout(row)
 
-        self._x_thresh_spin, self._x_rms_lbl, self._x_led = _ch_row("X", 0.05, 4)
-        self._y_thresh_spin, self._y_rms_lbl, self._y_led = _ch_row("Y", 0.05, 4)
-        self._z_thresh_spin, self._z_rms_lbl, self._z_led = _ch_row("Z", 100.0, 1)
-
-        # Veto + window settings
-        veto_row = QHBoxLayout()
+        # Veto row
+        cl.addWidget(_hsep())
+        vr = QHBoxLayout()
         self._veto_led = _led()
-        veto_row.addWidget(self._veto_led)
+        vr.addWidget(self._veto_led)
         vl = QLabel("Veto active")
         vl.setStyleSheet("color: #d97706; font-weight: bold;")
-        veto_row.addWidget(vl)
-        veto_row.addSpacing(16)
-
+        vr.addWidget(vl)
+        vr.addSpacing(8)
         for label, attr, default in [
-            ("Post-shake veto:", "_post_veto_spin", 1.0),
-            ("Window:",          "_win_spin",        1.0),
+            ("Post-veto:", "_post_veto_spin", 1.0),
+            ("Window:",    "_win_spin",        1.0),
         ]:
-            veto_row.addWidget(QLabel(label))
+            vr.addWidget(QLabel(label))
             sp = QDoubleSpinBox()
             sp.setRange(0.0, 60.0)
             sp.setValue(default)
             sp.setDecimals(1)
             sp.setSuffix(" s")
-            sp.setFixedWidth(70)
+            sp.setFixedWidth(68)
             setattr(self, attr, sp)
-            veto_row.addWidget(sp)
-            veto_row.addSpacing(4)
+            vr.addWidget(sp)
+            vr.addSpacing(4)
+        vr.addStretch()
+        cl.addLayout(vr)
 
-        veto_row.addStretch()
-        gl.addLayout(veto_row)
+        outer.addWidget(catch_box)
+
+        # ── Right column: Trapping + Lock Thresholds ──────────────────
+        right_col = QVBoxLayout()
+        right_col.setSpacing(6)
+
+        trap_box = QGroupBox("Trapping Thresholds")
+        trap_box.setStyleSheet("QGroupBox { font-weight: bold; }")
+        tl = QVBoxLayout(trap_box)
+        tl.setSpacing(5)
+
+        hint_t = QLabel("RMS above threshold after retraction → sphere in trap")
+        hint_t.setStyleSheet("color: #6b7280; font-size: 10px;")
+        hint_t.setWordWrap(True)
+        tl.addWidget(hint_t)
+
+        for axis, thresh_attr, led_attr, default in [
+            ("X", "_trap_x_thresh_spin", "_trap_x_led", 0.05),
+            ("Y", "_trap_y_thresh_spin", "_trap_y_led", 0.05),
+        ]:
+            row = QHBoxLayout()
+            row.addWidget(QLabel(f"{axis} thresh:"))
+            sp = QDoubleSpinBox()
+            sp.setRange(0.0, 1e7)
+            sp.setValue(default)
+            sp.setDecimals(4)
+            sp.setFixedWidth(88)
+            setattr(self, thresh_attr, sp)
+            row.addWidget(sp)
+            led = _led()
+            setattr(self, led_attr, led)
+            row.addWidget(led)
+            row.addWidget(QLabel(f"{axis} trapped"))
+            row.addStretch()
+            tl.addLayout(row)
+
+        right_col.addWidget(trap_box)
+
+        lock_box = QGroupBox("Lock Thresholds")
+        lock_box.setStyleSheet("QGroupBox { font-weight: bold; }")
+        ll = QVBoxLayout(lock_box)
+        ll.setSpacing(5)
+
+        hint_l = QLabel("RMS below threshold → sphere stable and locked")
+        hint_l.setStyleSheet("color: #6b7280; font-size: 10px;")
+        hint_l.setWordWrap(True)
+        ll.addWidget(hint_l)
+
+        for axis, thresh_attr, led_attr, default, dec in [
+            ("X", "_lock_x_thresh_spin", "_lock_x_led", 0.02,  4),
+            ("Y", "_lock_y_thresh_spin", "_lock_y_led", 0.02,  4),
+            ("Z", "_lock_z_thresh_spin", "_lock_z_led", 50.0,  1),
+        ]:
+            row = QHBoxLayout()
+            row.addWidget(QLabel(f"{axis} thresh:"))
+            sp = QDoubleSpinBox()
+            sp.setRange(0.0, 1e7)
+            sp.setValue(default)
+            sp.setDecimals(dec)
+            sp.setFixedWidth(88)
+            setattr(self, thresh_attr, sp)
+            row.addWidget(sp)
+            led = _led()
+            setattr(self, led_attr, led)
+            row.addWidget(led)
+            row.addWidget(QLabel(f"{axis} locked"))
+            row.addStretch()
+            ll.addLayout(row)
+
+        right_col.addWidget(lock_box)
+        right_col.addStretch()
+
+        right_w = QWidget()
+        right_w.setLayout(right_col)
+        outer.addWidget(right_w)
 
         return grp
 
@@ -350,7 +480,6 @@ class TrappingPanel(QWidget):
         grp = QGroupBox("Feedback Presets")
         pg = QGridLayout()
         pg.setSpacing(5)
-        pg.setColumnStretch(0, 1)
 
         for col, text in [(1, "Prepare Trap"), (2, "Start Feedback"), (3, "Current FPGA")]:
             hdr = QLabel(f"<b>{text}</b>")
@@ -360,7 +489,6 @@ class TrappingPanel(QWidget):
         for row, (field, _reg, is_int) in enumerate(PRESET_FIELDS, start=1):
             pg.addWidget(QLabel(field), row, 0)
 
-            # Prepare Trap column — always a spinbox
             sp_prep = QDoubleSpinBox()
             sp_prep.setRange(-1e7, 1e7)
             if is_int:
@@ -397,7 +525,6 @@ class TrappingPanel(QWidget):
                 self._preset_spins["feedback"][field] = sp_fb
                 pg.addWidget(sp_fb, row, 2)
 
-            # Current FPGA column — gray readback for all rows
             rb_lbl = QLabel("—")
             rb_lbl.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
             rb_lbl.setStyleSheet("color: #6b7280;")
@@ -405,8 +532,7 @@ class TrappingPanel(QWidget):
             self._preset_readback_lbls[field] = rb_lbl
             pg.addWidget(rb_lbl, row, 3)
 
-        brow = len(PRESET_FIELDS) + 1
-        arow = brow
+        arow = len(PRESET_FIELDS) + 1
         prep_btn = QPushButton("Prepare Trap")
         prep_btn.setStyleSheet(
             "QPushButton { font-weight: bold; padding: 5px; "
@@ -525,7 +651,6 @@ class TrappingPanel(QWidget):
         bi.addWidget(self._rms_z_disp_lbl)
         bi.addSpacing(12)
 
-        # Separate LED for "sphere at trap centre" (distinct from Z detected LED)
         self._center_led = _led()
         bi.addWidget(self._center_led)
         self._center_lbl = QLabel("Sphere at centre")
@@ -538,15 +663,126 @@ class TrappingPanel(QWidget):
         grp.setLayout(lg)
         return grp
 
+    # ---- Trapping macros ----
+
+    def _build_macro_group(self) -> QGroupBox:
+        grp = QGroupBox("Trapping Macros")
+        gl = QVBoxLayout(grp)
+        gl.setSpacing(8)
+
+        # Status LED row
+        status_row = QHBoxLayout()
+        status_row.addWidget(QLabel("Status:"))
+
+        self._macro_caught_led = _led()
+        status_row.addWidget(self._macro_caught_led)
+        status_row.addWidget(QLabel("Caught"))
+        status_row.addSpacing(10)
+
+        self._macro_trapped_led = _led()
+        status_row.addWidget(self._macro_trapped_led)
+        status_row.addWidget(QLabel("Trapped"))
+        status_row.addSpacing(10)
+
+        self._macro_locked_led = _led()
+        status_row.addWidget(self._macro_locked_led)
+        status_row.addWidget(QLabel("Locked"))
+        status_row.addSpacing(20)
+
+        self._macro_status_lbl = QLabel("Idle")
+        self._macro_status_lbl.setStyleSheet("color: #6b7280; font-style: italic;")
+        status_row.addWidget(self._macro_status_lbl, stretch=1)
+        gl.addLayout(status_row)
+
+        # Settings row
+        settings_row = QHBoxLayout()
+        settings_row.addWidget(QLabel("Retract delay:"))
+        self._retract_delay_spin = QDoubleSpinBox()
+        self._retract_delay_spin.setRange(0.0, 60.0)
+        self._retract_delay_spin.setValue(3.0)
+        self._retract_delay_spin.setDecimals(1)
+        self._retract_delay_spin.setSuffix(" s")
+        self._retract_delay_spin.setFixedWidth(80)
+        self._retract_delay_spin.setToolTip(
+            "Time to wait after dropper retraction before checking trapping thresholds")
+        settings_row.addWidget(self._retract_delay_spin)
+        settings_row.addSpacing(16)
+
+        settings_row.addWidget(QLabel("Trap check timeout:"))
+        self._trap_timeout_spin = QDoubleSpinBox()
+        self._trap_timeout_spin.setRange(5.0, 300.0)
+        self._trap_timeout_spin.setValue(30.0)
+        self._trap_timeout_spin.setDecimals(0)
+        self._trap_timeout_spin.setSuffix(" s")
+        self._trap_timeout_spin.setFixedWidth(80)
+        self._trap_timeout_spin.setToolTip(
+            "Give up if trapping thresholds are not met within this time")
+        settings_row.addWidget(self._trap_timeout_spin)
+        settings_row.addStretch()
+        gl.addLayout(settings_row)
+
+        # Button row
+        btn_row = QHBoxLayout()
+
+        self._macro_trap_btn = QPushButton("Trap Sphere")
+        self._macro_trap_btn.setFixedHeight(36)
+        self._macro_trap_btn.setMinimumWidth(140)
+        self._macro_trap_btn.setStyleSheet(
+            "QPushButton { background-color: #2563eb; color: white; "
+            "font-weight: bold; font-size: 12px; border-radius: 4px; }"
+            "QPushButton:hover { background-color: #3b82f6; }"
+            "QPushButton:disabled { background-color: #d1d5db; color: #9ca3af; }"
+        )
+        self._macro_trap_btn.clicked.connect(self._on_macro_trap)
+        btn_row.addWidget(self._macro_trap_btn)
+
+        self._macro_continue_btn = QPushButton("Continue Trapping")
+        self._macro_continue_btn.setFixedHeight(36)
+        self._macro_continue_btn.setMinimumWidth(160)
+        self._macro_continue_btn.setStyleSheet(
+            "QPushButton { background-color: #7c3aed; color: white; "
+            "font-weight: bold; font-size: 12px; border-radius: 4px; }"
+            "QPushButton:hover { background-color: #9333ea; }"
+            "QPushButton:disabled { background-color: #d1d5db; color: #9ca3af; }"
+        )
+        self._macro_continue_btn.clicked.connect(self._on_macro_continue)
+        btn_row.addWidget(self._macro_continue_btn)
+
+        self._macro_release_btn = QPushButton("Release Sphere")
+        self._macro_release_btn.setFixedHeight(36)
+        self._macro_release_btn.setMinimumWidth(140)
+        self._macro_release_btn.setStyleSheet(
+            "QPushButton { background-color: #d97706; color: white; "
+            "font-weight: bold; font-size: 12px; border-radius: 4px; }"
+            "QPushButton:hover { background-color: #f59e0b; }"
+        )
+        self._macro_release_btn.clicked.connect(self._on_macro_release)
+        btn_row.addWidget(self._macro_release_btn)
+
+        self._macro_abort_btn = QPushButton("■  Abort")
+        self._macro_abort_btn.setFixedHeight(36)
+        self._macro_abort_btn.setStyleSheet(
+            "QPushButton { background-color: #dc2626; color: white; "
+            "font-weight: bold; font-size: 12px; border-radius: 4px; }"
+            "QPushButton:hover { background-color: #ef4444; }"
+        )
+        self._macro_abort_btn.clicked.connect(self._on_macro_abort)
+        btn_row.addWidget(self._macro_abort_btn)
+
+        btn_row.addStretch()
+        gl.addLayout(btn_row)
+
+        return grp
+
     # ------------------------------------------------------------------
     # Fast data handling (main thread via queued signal)
     # ------------------------------------------------------------------
 
     def _on_fast_data_ui(self, values: dict) -> None:
-        t      = time.monotonic()
+        t       = time.monotonic()
         in_veto = self._shaking or t < self._veto_until
-        win_s  = self._win_spin.value()
-        cutoff = t - win_s
+        win_s   = self._win_spin.value()
+        cutoff  = t - win_s
 
         # Veto LED
         self._veto_led.setStyleSheet(_LED_VETO if in_veto else _LED_OFF)
@@ -569,7 +805,6 @@ class TrappingPanel(QWidget):
         while self._y_buf and self._y_buf[0][0] < cutoff:
             self._y_buf.popleft()
 
-        # RMS (std removes DC component — sensitive to oscillations)
         def _rms(buf):
             if len(buf) < 2:
                 return 0.0
@@ -585,7 +820,9 @@ class TrappingPanel(QWidget):
         z_rms  = _rms(self._z_buf)
         z_mean = _mean(self._z_buf)
 
-        # Cache for lower timer
+        # Cache for lower timer and macro state machine
+        self._x_rms  = x_rms
+        self._y_rms  = y_rms
         self._z_mean = z_mean
         self._z_rms  = z_rms
 
@@ -597,7 +834,7 @@ class TrappingPanel(QWidget):
         self._rms_z_disp_lbl.setText(f"{z_rms:.1f}")
         self._z_setpoint_hint_lbl.setText(f"(avg: {z_mean:.0f})")
 
-        # Detection thresholds
+        # Catching detection thresholds (above = sphere detected)
         x_det = x_rms > self._x_thresh_spin.value()
         y_det = y_rms > self._y_thresh_spin.value()
         z_det = z_rms > self._z_thresh_spin.value()
@@ -605,16 +842,40 @@ class TrappingPanel(QWidget):
         if x_det != self._x_detected:
             self._x_detected = x_det
             self._x_led.setStyleSheet(_LED_ON if x_det else _LED_OFF)
-
         if y_det != self._y_detected:
             self._y_detected = y_det
             self._y_led.setStyleSheet(_LED_ON if y_det else _LED_OFF)
-
         if z_det != self._z_detected:
             self._z_detected = z_det
             self._z_led.setStyleSheet(_LED_ON if z_det else _LED_OFF)
 
-        # Auto-catch: stop shaking when both X and Y are detected (outside veto)
+        # Trapping thresholds (above = sphere present after retraction)
+        x_trap = x_rms > self._trap_x_thresh_spin.value()
+        y_trap = y_rms > self._trap_y_thresh_spin.value()
+
+        if x_trap != self._x_trapped:
+            self._x_trapped = x_trap
+            self._trap_x_led.setStyleSheet(_LED_ON if x_trap else _LED_OFF)
+        if y_trap != self._y_trapped:
+            self._y_trapped = y_trap
+            self._trap_y_led.setStyleSheet(_LED_ON if y_trap else _LED_OFF)
+
+        # Lock thresholds (below = sphere stable / locked)
+        x_lock = x_rms < self._lock_x_thresh_spin.value()
+        y_lock = y_rms < self._lock_y_thresh_spin.value()
+        z_lock = z_rms < self._lock_z_thresh_spin.value()
+
+        if x_lock != self._x_locked:
+            self._x_locked = x_lock
+            self._lock_x_led.setStyleSheet(_LED_ON if x_lock else _LED_OFF)
+        if y_lock != self._y_locked:
+            self._y_locked = y_lock
+            self._lock_y_led.setStyleSheet(_LED_ON if y_lock else _LED_OFF)
+        if z_lock != self._z_locked:
+            self._z_locked = z_lock
+            self._lock_z_led.setStyleSheet(_LED_ON if z_lock else _LED_OFF)
+
+        # Auto-catch: stop shaking when both X and Y detected outside veto
         if (self._auto_catch_check.isChecked()
                 and x_det and y_det
                 and not in_veto
@@ -627,18 +888,14 @@ class TrappingPanel(QWidget):
 
     def _on_shake_event(self, event_type: str) -> None:
         if event_type == "start":
-            # Sequence beginning — clear stale data; sweep_start will arm the veto
             self._x_buf.clear()
             self._y_buf.clear()
         elif event_type == "sweep_start":
-            # AWG about to fire — veto active for this sweep
             self._shaking = True
         elif event_type == "step":
-            # Sweep done, dwell beginning — clear sweep veto, start post-veto settling
             self._shaking = False
             self._veto_until = time.monotonic() + self._post_veto_spin.value()
         elif event_type == "done":
-            # Full sequence finished — final post-veto settling window
             self._shaking = False
             self._veto_until = time.monotonic() + self._post_veto_spin.value()
 
@@ -649,7 +906,6 @@ class TrappingPanel(QWidget):
     def _move_preset(self, name: str) -> None:
         if self._dropper_widget is None:
             return
-        # Push the local preset value into the dropper tab's spinbox, then move
         val = self._dropper_spins[name].value()
         dw  = self._dropper_widget
         if name in dw._preset_spins:
@@ -687,7 +943,6 @@ class TrappingPanel(QWidget):
         except Exception:
             self._current_dc = 0.0
 
-        # Auto-set Z setpoint from current mean Z in the sliding window buffer
         if self._z_buf:
             self._z_setpoint_spin.setValue(int(round(self._z_mean)))
 
@@ -702,30 +957,28 @@ class TrappingPanel(QWidget):
         self._lower_timer.stop()
 
     def _on_lower_timer(self) -> None:
-        mean_z = self._z_mean
-        rms_z  = self._z_rms
-
         if not self._lowering:
             return
 
+        mean_z     = self._z_mean
         z_setpoint = self._z_setpoint_spin.value()
         tolerance  = self._z_tol_spin.value()
 
-        # Freeze: Z signal detected AND mean near setpoint
+        # Freeze: Z detected AND mean near setpoint
         if self._z_detected and abs(mean_z - z_setpoint) <= tolerance:
             self._lowering = False
             self._lower_timer.stop()
-            # Write the final frozen value explicitly so FPGA holds the settled position
             try:
                 if self._fpga is not None and self._fpga.is_connected:
                     self._fpga.write_register("DC offset Z", round(self._current_dc))
+                    # Sync Z Setpoint register to the value used for the freeze
+                    self._fpga.write_register("Z Setpoint", z_setpoint)
             except Exception:
                 pass
             self._center_led.setStyleSheet(_LED_ON)
             self._center_lbl.setVisible(True)
             return
 
-        # Step DC offset downward
         interval_ms = self._interval_spin.value()
         delta       = self._dac_per_s_spin.value() * (interval_ms / 1000.0)
         new_dc      = self._current_dc - delta
@@ -753,7 +1006,7 @@ class TrappingPanel(QWidget):
             return
         for field, reg in self._preset_regs.items():
             if field not in self._preset_spins[key]:
-                continue  # DC offset Z not in "feedback" spinboxes — set by Lower Sphere
+                continue
             val = self._preset_spins[key][field].value()
             try:
                 self._fpga.write_register(reg, val)
@@ -761,8 +1014,7 @@ class TrappingPanel(QWidget):
                 pass
 
     def update_preset_readbacks(self, state: dict) -> None:
-        """Update gray readback labels in the Feedback Presets grid and lower-sphere
-        section from an FPGA register snapshot (slow poll, ~5 Hz)."""
+        """Update gray readback labels from an FPGA register snapshot (slow poll, ~5 Hz)."""
         for field, reg, is_int in PRESET_FIELDS:
             val = state.get(reg)
             if val is None:
@@ -771,18 +1023,157 @@ class TrappingPanel(QWidget):
             lbl = self._preset_readback_lbls.get(field)
             if lbl is not None:
                 lbl.setText(text)
-            # DC offset Z col-2 label (no spinbox) mirrors the FPGA readback
             if field == "DC offset Z" and self._dc_offset_fb_lbl is not None:
                 self._dc_offset_fb_lbl.setText(text)
-            # Lower-sphere DC offset readback — only when not actively lowering
             if field == "DC offset Z" and not self._lowering:
                 self._lower_dc_offset_lbl.setText(text)
 
+    # ------------------------------------------------------------------
+    # Macro state machine
+    # ------------------------------------------------------------------
+
+    def _on_macro_trap(self) -> None:
+        """Start full Trap Sphere sequence."""
+        if self._macro_state != _ST_IDLE:
+            return
+        if self._shaker_widget is None:
+            self._macro_status_lbl.setText("No shaker connected")
+            return
+
+        # Newbie token: first run starts from scratch; retries resume then fall back to fresh
+        if self._macro_first_run:
+            self._macro_first_run = False
+            ok = self._shaker_widget.start_shaking_public(
+                start_v=self._sk_start_v.value(),
+                step_v=self._sk_step_v.value(),
+                n_steps=self._sk_steps.value(),
+                dwell_s=self._sk_dwell.value(),
+                max_v=self._sk_max_v.value(),
+            )
+        else:
+            ok = self._shaker_widget.resume_shaking_public()
+            if not ok:
+                ok = self._shaker_widget.start_shaking_public(
+                    start_v=self._sk_start_v.value(),
+                    step_v=self._sk_step_v.value(),
+                    n_steps=self._sk_steps.value(),
+                    dwell_s=self._sk_dwell.value(),
+                    max_v=self._sk_max_v.value(),
+                )
+
+        if not ok:
+            self._macro_status_lbl.setText("Cannot start — AWG/PSU not connected")
+            return
+
+        self._macro_caught   = False
+        self._macro_trapped  = False
+        self._macro_locked_f = False
+        self._macro_caught_led.setStyleSheet(_LED_OFF)
+        self._macro_trapped_led.setStyleSheet(_LED_OFF)
+        self._macro_locked_led.setStyleSheet(_LED_OFF)
+        self._macro_state  = _ST_SHAKING
+        self._macro_status_lbl.setText("Shaking — waiting for sphere catch…")
+        self._macro_timer.start(250)
+
+    def _on_macro_continue(self) -> None:
+        """Skip shaking; retract dropper and check trapping thresholds."""
+        if self._macro_state != _ST_IDLE:
+            return
+        self._macro_caught  = True
+        self._macro_trapped = False
+        self._macro_locked_f = False
+        self._macro_caught_led.setStyleSheet(_LED_ON)
+        self._macro_trapped_led.setStyleSheet(_LED_OFF)
+        self._macro_locked_led.setStyleSheet(_LED_OFF)
+        self._move_preset("retraction")
+        self._macro_retract_t = time.monotonic()
+        self._macro_state = _ST_RETRACTING
+        self._macro_status_lbl.setText("Retracting dropper…")
+        self._macro_timer.start(250)
+
+    def _on_macro_release(self) -> None:
+        """Release sphere by writing DC offset Z → 0."""
+        if self._fpga is None or not self._fpga.is_connected:
+            self._macro_status_lbl.setText("FPGA not connected")
+            return
+        try:
+            self._fpga.write_register("DC offset Z", 0)
+        except Exception:
+            pass
+        self._macro_status_lbl.setText("Released — DC offset Z → 0")
+
+    def _on_macro_abort(self) -> None:
+        self._macro_timer.stop()
+        self._macro_state = _ST_IDLE
+        if self._shaker_widget and self._shaker_widget.is_shaking():
+            self._shaker_widget.request_stop()
+        if self._lowering:
+            self._on_stop_lower()
+        self._macro_status_lbl.setText("Aborted")
+
+    def _on_macro_tick(self) -> None:
+        """250 ms polling for macro state machine."""
+        now = time.monotonic()
+
+        if self._macro_state == _ST_IDLE:
+            self._macro_timer.stop()
+
+        elif self._macro_state == _ST_SHAKING:
+            in_veto = self._shaking or now < self._veto_until
+            if not in_veto and self._x_detected and self._y_detected:
+                if self._shaker_widget:
+                    self._shaker_widget.request_stop()
+                self._move_preset("retraction")
+                self._macro_caught = True
+                self._macro_caught_led.setStyleSheet(_LED_ON)
+                self._macro_retract_t = now
+                self._macro_state = _ST_RETRACTING
+                self._macro_status_lbl.setText("Caught! Retracting dropper…")
+
+        elif self._macro_state == _ST_RETRACTING:
+            if now - self._macro_retract_t >= self._retract_delay_spin.value():
+                self._macro_trap_t = now
+                self._macro_state  = _ST_TRAPPING
+                self._macro_status_lbl.setText("Dropper retracted — checking trap…")
+
+        elif self._macro_state == _ST_TRAPPING:
+            if self._x_trapped and self._y_trapped:
+                self._macro_trapped = True
+                self._macro_trapped_led.setStyleSheet(_LED_ON)
+                self._on_lower_sphere()
+                self._macro_state = _ST_LOWERING
+                self._macro_status_lbl.setText("Trapped! Lowering to trap centre…")
+            elif now - self._macro_trap_t > self._trap_timeout_spin.value():
+                self._macro_state = _ST_IDLE
+                self._macro_timer.stop()
+                self._macro_status_lbl.setText("Trap check timeout — no sphere detected")
+
+        elif self._macro_state == _ST_LOWERING:
+            if not self._lowering:
+                # Lower sphere complete — check lock
+                if self._x_locked and self._y_locked and self._z_locked:
+                    self._macro_locked_f = True
+                    self._macro_locked_led.setStyleSheet(_LED_ON)
+                    self._macro_state = _ST_LOCKED
+                    self._macro_timer.stop()
+                    self._macro_status_lbl.setText("Locked! Sphere stable at trap centre.")
+                else:
+                    self._macro_status_lbl.setText(
+                        f"At centre — waiting for lock  "
+                        f"X:{self._x_rms:.4f}  Y:{self._y_rms:.4f}  Z:{self._z_rms:.1f}"
+                    )
+
+        elif self._macro_state == _ST_LOCKED:
+            self._macro_timer.stop()
+
+    # ------------------------------------------------------------------
+    # Session state
+    # ------------------------------------------------------------------
+
     def get_ui_state(self) -> dict:
-        """Return all widget values for unified session state persistence."""
         return {
-            "prepare": {field: sp.value() for field, sp in self._preset_spins["prepare"].items()},
-            "feedback": {field: sp.value() for field, sp in self._preset_spins["feedback"].items()},
+            "prepare":  {f: sp.value() for f, sp in self._preset_spins["prepare"].items()},
+            "feedback": {f: sp.value() for f, sp in self._preset_spins["feedback"].items()},
             "lower_sphere": {
                 "dac_per_s":   self._dac_per_s_spin.value(),
                 "lower_limit": self._lower_limit_spin.value(),
@@ -796,6 +1187,11 @@ class TrappingPanel(QWidget):
                 "z_thresh":  self._z_thresh_spin.value(),
                 "post_veto": self._post_veto_spin.value(),
                 "window_s":  self._win_spin.value(),
+                "trap_x_thresh": self._trap_x_thresh_spin.value(),
+                "trap_y_thresh": self._trap_y_thresh_spin.value(),
+                "lock_x_thresh": self._lock_x_thresh_spin.value(),
+                "lock_y_thresh": self._lock_y_thresh_spin.value(),
+                "lock_z_thresh": self._lock_z_thresh_spin.value(),
             },
             "dropper_shortcuts": {n: sp.value() for n, sp in self._dropper_spins.items()},
             "shaker_shortcuts": {
@@ -805,10 +1201,13 @@ class TrappingPanel(QWidget):
                 "dwell_s": self._sk_dwell.value(),
                 "max_v":   self._sk_max_v.value(),
             },
+            "macro": {
+                "retract_delay":   self._retract_delay_spin.value(),
+                "trap_timeout":    self._trap_timeout_spin.value(),
+            },
         }
 
     def restore_ui_state(self, state: dict) -> None:
-        """Restore all widget values from a unified session state dict."""
         for key, spins in self._preset_spins.items():
             if key in state:
                 for field, sp in spins.items():
@@ -833,11 +1232,16 @@ class TrappingPanel(QWidget):
         _set("_interval_spin",    ls, "interval_ms")
 
         det = state.get("detection", {})
-        _set("_x_thresh_spin",  det, "x_thresh")
-        _set("_y_thresh_spin",  det, "y_thresh")
-        _set("_z_thresh_spin",  det, "z_thresh")
-        _set("_post_veto_spin", det, "post_veto")
-        _set("_win_spin",       det, "window_s")
+        _set("_x_thresh_spin",       det, "x_thresh")
+        _set("_y_thresh_spin",       det, "y_thresh")
+        _set("_z_thresh_spin",       det, "z_thresh")
+        _set("_post_veto_spin",      det, "post_veto")
+        _set("_win_spin",            det, "window_s")
+        _set("_trap_x_thresh_spin",  det, "trap_x_thresh")
+        _set("_trap_y_thresh_spin",  det, "trap_y_thresh")
+        _set("_lock_x_thresh_spin",  det, "lock_x_thresh")
+        _set("_lock_y_thresh_spin",  det, "lock_y_thresh")
+        _set("_lock_z_thresh_spin",  det, "lock_z_thresh")
 
         drp = state.get("dropper_shortcuts", {})
         for n, sp in self._dropper_spins.items():
@@ -854,12 +1258,17 @@ class TrappingPanel(QWidget):
         _set("_sk_dwell",   sk, "dwell_s")
         _set("_sk_max_v",   sk, "max_v")
 
+        mac = state.get("macro", {})
+        _set("_retract_delay_spin", mac, "retract_delay")
+        _set("_trap_timeout_spin",  mac, "trap_timeout")
+
     # ------------------------------------------------------------------
     # Cleanup
     # ------------------------------------------------------------------
 
     def teardown(self) -> None:
         self._lower_timer.stop()
+        self._macro_timer.stop()
 
 
 # ---------------------------------------------------------------------------
@@ -868,11 +1277,12 @@ class TrappingPanel(QWidget):
 
 class Procedure(ControlProcedure):
     NAME       = "Trapping"
-    PERSISTENT = True   # always loaded as a dedicated tab; excluded from Procedures list
+    PERSISTENT = True
     DESCRIPTION = (
         "Sphere trapping workflow: dropper stage shortcuts, shake-dropper "
-        "shortcuts with auto-catch, X/Y/Z RMS sphere detection with configurable "
-        "veto window, feedback presets, and lower-sphere DC ramp with auto-freeze."
+        "shortcuts with auto-catch, X/Y/Z RMS catching / trapping / lock thresholds, "
+        "feedback presets with Z setpoint, lower-sphere DC ramp with auto-freeze, "
+        "and Trap Sphere / Continue / Release macros."
     )
 
     def __init__(self):
@@ -881,7 +1291,6 @@ class Procedure(ControlProcedure):
         self._shaker_widget  = None
 
     def set_instruments(self, dropper_widget, shaker_widget) -> None:
-        """Call before create_widget() so the panel can wire instrument callbacks."""
         self._dropper_widget = dropper_widget
         self._shaker_widget  = shaker_widget
         if self._widget is not None:
