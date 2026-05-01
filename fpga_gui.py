@@ -1980,20 +1980,27 @@ class FPGAWidget(QWidget):
             return
         values = self._ctrl.read_all()
         self._update_reg_edits(values, initial=True)
+        self._sync_count_usec(values)
         self._append_status(f"Read {len(values)} registers")
+
+    def _sync_count_usec(self, values: dict) -> None:
+        """Update Sa/s label and sample rate from Count(uSec) if it changed."""
+        count_usec = values.get("Count(uSec)")
+        if count_usec is None or count_usec <= 0:
+            return
+        if count_usec == self._wd_last_count_usec:
+            return
+        self._wd_last_count_usec = count_usec
+        self._wd_sample_rate = 1e6 / count_usec
+        self._wd_samplerate_lbl.setText(f"{int(round(self._wd_sample_rate)):,}")
+        self._player_count_usec_spin.setValue(int(round(count_usec)))
+        self._on_wd_params_changed()
 
     def _on_registers_updated(self, values: dict) -> None:
         self._last_register_values = values
         self._update_reg_edits(values)
         self._resources.notify_fpga_update(values)
-        count_usec = values.get("Count(uSec)")
-        if count_usec and count_usec != self._wd_last_count_usec:
-            self._wd_last_count_usec = count_usec
-            self._wd_sample_rate = 1e6 / count_usec
-            sr_int = int(round(self._wd_sample_rate))
-            self._wd_samplerate_lbl.setText(f"{sr_int:,}")
-            self._player_count_usec_spin.setValue(int(round(count_usec)))
-            self._on_wd_params_changed()
+        self._sync_count_usec(values)
 
     def _on_plot_data(self, values: dict) -> None:
         self._plot_widget.push_values(values)
