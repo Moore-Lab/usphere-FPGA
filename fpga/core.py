@@ -408,27 +408,31 @@ class FPGAController:
             return
 
         # --- Register write path ---
-        # Bitfile analysis shows ready_to_write is a HOST-written control
-        # (Indicator=false), not an FPGA indicator.  The correct protocol:
-        #   1. Set ready_to_write = True (enable FPGA latching)
-        #   2. Loop: write write_address + data_buffer_N for each sample
-        #   3. Set ready_to_write = False
+        # Bitfile analysis: ready_to_write is a HOST-written control (Indicator=false).
+        # The FPGA continuously latches memory[write_address] ← data_buffer while
+        # ready_to_write=True, so holding it high for the whole loop creates a race:
+        # the FPGA sees the new address before the new data arrives, writing the
+        # previous sample's data to the new address.  This produces a waveform with
+        # the correct envelope but corrupted per-sample values.
+        #
+        # Fix: write data FIRST (so it is stable), then address, then pulse
+        # ready_to_write True→False per sample so the FPGA only latches when
+        # both address and data are settled.
         #
         # Data buffers are I16 — clip to ±32767 before writing.
-        # Entire loop runs inside one lock acquisition: no per-sample lock
-        # overhead, no _append_log per write.
         buf_names = ["data_buffer_1", "data_buffer2", "data_buffer3"]
         int_data = np.clip(np.round(data[:, :n_ch]), -32768, 32767).astype(int)
         addr_reg  = REGISTER_MAP["write_address"]
         rtw_reg   = REGISTER_MAP["ready_to_write"]
         buf_regs  = [REGISTER_MAP[buf_names[c]] for c in range(n_ch)]
         with self._lock:
-            self._write_one("ready_to_write", True, rtw_reg)
+            self._write_one("ready_to_write", False, rtw_reg)  # ensure clean start
             for i in range(n_samples):
-                self._write_one("write_address", i, addr_reg)
                 for c in range(n_ch):
                     self._write_one(buf_names[c], int(int_data[i, c]), buf_regs[c])
-            self._write_one("ready_to_write", False, rtw_reg)
+                self._write_one("write_address", i, addr_reg)
+                self._write_one("ready_to_write", True, rtw_reg)
+                self._write_one("ready_to_write", False, rtw_reg)
         self._log(f"Arb write complete: {n_samples} samples")
         _append_log("arb_write", {"samples": n_samples, "channels": n_ch})
 
