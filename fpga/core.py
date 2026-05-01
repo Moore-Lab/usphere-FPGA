@@ -18,6 +18,7 @@ hardware.
 
 from __future__ import annotations
 
+import ctypes
 import datetime
 import json
 import threading
@@ -391,7 +392,7 @@ class FPGAController:
                 time.sleep(0.001)
             self.write_register("write_address", i)
             for c in range(min(n_cols, 3)):
-                self.write_register(buf_names[c], data[i, c])
+                self.write_register(buf_names[c], int(round(data[i, c])))
         self._log(f"Arb write complete: {n_samples} samples")
 
     def load_arb_waveform(self, filepath: Path | str) -> None:
@@ -512,11 +513,12 @@ class FPGAController:
             else:
                 # FXP / SGL / DBL registers expect float.  If the LabVIEW VI
                 # uses an integer type that isn't yet flagged with is_integer,
-                # ctypes raises TypeError — catch it and retry as int so the
-                # write succeeds; mark the register is_integer to fix it properly.
+                # nifpga raises ctypes.ArgumentError (not TypeError) — catch both
+                # and retry as int.  Mark is_integer=True in fpga_registers.py to
+                # avoid the overhead.
                 try:
                     nifpga_reg.write(float(value))
-                except TypeError:
+                except (TypeError, ctypes.ArgumentError):
                     nifpga_reg.write(int(round(float(value))))
                     self._log(
                         f"[type warning] {name!r} rejected float — "
