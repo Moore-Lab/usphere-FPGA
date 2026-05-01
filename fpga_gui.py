@@ -690,6 +690,7 @@ class FPGAWidget(QWidget):
         self._wd_mc_worker: _CombMCWorker | None = None
         self._wd_mc_stop_flag: list[bool] = [False]
         self._wd_has_plot: bool = False  # set in _build_waveform_designer
+        self._wd_last_count_usec: float | None = None  # last FPGA Count(uSec)
 
         # Session state
         self._session_state: dict = {}         # loaded by _restore_full_state
@@ -1983,6 +1984,12 @@ class FPGAWidget(QWidget):
         self._last_register_values = values
         self._update_reg_edits(values)
         self._resources.notify_fpga_update(values)
+        count_usec = values.get("Count(uSec)")
+        if count_usec and count_usec != self._wd_last_count_usec:
+            self._wd_last_count_usec = count_usec
+            sample_rate = int(round(1e6 / count_usec))
+            self._wd_samplerate_edit.setText(str(sample_rate))
+            self._player_count_usec_spin.setValue(int(round(count_usec)))
 
     def _on_plot_data(self, values: dict) -> None:
         self._plot_widget.push_values(values)
