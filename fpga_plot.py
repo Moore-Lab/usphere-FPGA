@@ -24,7 +24,7 @@ import time
 
 import numpy as np
 import pyqtgraph as pg
-from PyQt5.QtCore import Qt, QSettings, QTimer
+from PyQt5.QtCore import Qt, QSettings, QTimer, pyqtSignal
 from PyQt5.QtWidgets import (
     QCheckBox,
     QComboBox,
@@ -234,6 +234,10 @@ class FPGAPlotWidget(QWidget):
     a QTimer redraws at ~60 fps by updating curve data in-place.
     """
 
+    # Signal used to safely deliver data from the monitor background thread
+    # to the Qt main thread (queued connection across thread boundary).
+    _incoming = pyqtSignal(dict)
+
     HISTORY_SEC = 10.0    # visible window (seconds)
     BUF_CAPACITY = 20000  # ring-buffer size (10 s @ 2 kHz)
     REFRESH_MS = 33       # ~30 fps redraw timer (less GPU contention)
@@ -252,6 +256,10 @@ class FPGAPlotWidget(QWidget):
         self._plots: dict[str, pg.PlotItem] = {}
 
         self._build_ui()
+
+        # Queued connection: monitor thread emits _incoming → main thread runs
+        # _receive_values, so ring-buffer writes always happen on the main thread.
+        self._incoming.connect(self._receive_values)
 
         self._timer = QTimer(self)
         self._timer.timeout.connect(self._redraw)
@@ -304,7 +312,15 @@ class FPGAPlotWidget(QWidget):
     # ── Public API ────────────────────────────────────────────────────
 
     def push_values(self, values: dict[str, float]) -> None:
-        """Buffer one sample per channel. No drawing here."""
+        """Thread-safe entry point — may be called from any thread.
+
+        Emits _incoming so the actual buffer write happens on the main thread,
+        eliminating the torn-read race with the redraw timer.
+        """
+        self._incoming.emit(values)
+
+    def _receive_values(self, values: dict[str, float]) -> None:
+        """Runs on the main thread via queued signal connection."""
         t = time.monotonic() - self._t0
         self._times.append(t)
         for reg_name, buf in self._bufs.items():

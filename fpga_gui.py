@@ -51,7 +51,8 @@ from PyQt5.QtWidgets import (
     QWidget,
 )
 
-from fpga_core import FPGAConfig, FPGAController, load_last_session, _append_log
+from fpga_core import FPGAConfig, FPGAController, _append_log
+from session_state import load_state as _load_session_state, save_state as _save_session_state
 from modules import discover_hardware_modules
 from procedures.base import LiveFPGAFacade
 from fpga_registers import (
@@ -530,8 +531,20 @@ class FPGAWidget(QWidget):
         self._wd_mc_stop_flag: list[bool] = [False]
         self._wd_has_plot: bool = False  # set in _build_waveform_designer
 
+        # Trapping procedure widget ref (set in _build_ui, used in _on_plot_data)
+        self._trap_proc_widget = None
+
+        # Session state
+        self._session_state: dict = {}         # loaded by _restore_full_state
+        self._last_register_values: dict = {}  # updated by _on_registers_updated
+
         self._build_ui()
-        self._restore_session()
+        self._restore_full_state()
+
+        # Autosave every 5 s + on close
+        self._autosave_timer = QTimer(self)
+        self._autosave_timer.timeout.connect(self._autosave_state)
+        self._autosave_timer.start(5000)
 
     # ==================================================================
     # UI construction
@@ -546,6 +559,29 @@ class FPGAWidget(QWidget):
         tabs.addTab(self._build_connection_tab(), "Connection")
         tabs.addTab(self._build_feedback_tab(), "Feedback")
         tabs.addTab(self._build_waveform_tab(), "Waveform")
+
+        # Persistent procedure tabs — always visible, no load/unload needed
+        from procedures import proc_position_dropper, proc_shake_dropper, proc_trapping
+        _facade = LiveFPGAFacade(self._ctrl)
+
+        self._dropper_proc = proc_position_dropper.Procedure()
+        self._dropper_proc.fpga = _facade
+        _dropper_widget = self._dropper_proc.create_widget()
+
+        self._shaker_proc = proc_shake_dropper.Procedure()
+        self._shaker_proc.fpga = _facade
+        _shaker_widget = self._shaker_proc.create_widget()
+
+        self._trap_proc = proc_trapping.Procedure()
+        self._trap_proc.fpga = _facade
+        self._trap_proc.set_instruments(_dropper_widget, _shaker_widget)
+        _trap_widget = self._trap_proc.create_widget()
+        self._trap_proc_widget = self._trap_proc._widget
+
+        tabs.addTab(_trap_widget,    "Trapping")
+        tabs.addTab(_dropper_widget, "Dropper Stage")
+        tabs.addTab(_shaker_widget,  "Shake Dropper")
+
         tabs.addTab(self._build_outputs_tab(), "Outputs")
         tabs.addTab(self._build_registers_tab(), "All Registers")
         tabs.addTab(self._build_plot_tab(), "Monitor")
@@ -555,7 +591,7 @@ class FPGAWidget(QWidget):
         self._modules_widget = _ModulesWidget()
         tabs.addTab(self._modules_widget, "Modules")
 
-        # Procedure manager (Load / Unload buttons; loaded procedures add more tabs)
+        # Dynamic procedure loader (for any other procedures in procedures/)
         self._proc_manager = _ProcedureManagerWidget(tabs, self._ctrl)
         tabs.addTab(self._proc_manager, "Procedures")
 
@@ -756,7 +792,7 @@ class FPGAWidget(QWidget):
         r = self._add_reg(bg, r, f"{a} Setpoint")
         r = self._add_reg(bg, r, f"DC offset {a}")
         r = self._add_reg(bg, r, f"pg {a}")
-        ig_name = f"ig {a}" if a == "X" else f" ig {a}"
+        ig_name = f" ig {a}"
         r = self._add_reg(bg, r, ig_name)
         r = self._add_reg(bg, r, f"dg {a}")
         r = self._add_reg(bg, r, f"dg band {a}")
@@ -944,7 +980,7 @@ class FPGAWidget(QWidget):
         r1 = QHBoxLayout()
         r1.addWidget(QLabel("Points:"))
         self._wd_npoints_combo = QComboBox()
-        self._wd_npoints_combo.addItems([str(2**n) for n in range(10, 18)])
+        self._wd_npoints_combo.addItems([str(2**n) for n in range(10, 21)])
         self._wd_npoints_combo.setCurrentText("16384")
         self._wd_npoints_combo.currentTextChanged.connect(self._on_wd_params_changed)
         r1.addWidget(self._wd_npoints_combo)
@@ -1264,25 +1300,27 @@ class FPGAWidget(QWidget):
         r1.addWidget(self._player_write_btn)
         layout.addLayout(r1)
 
-        # Row 2: Bit depth + Arb gains (inline compact)
+        # Row 2: Count(uSec) + Arb gains (inline compact)
         r2 = QHBoxLayout()
-        r2.addWidget(QLabel("Bits:"))
-        self._player_bits_spin = QSpinBox()
-        self._player_bits_spin.setRange(4, 16)
-        self._player_bits_spin.setValue(12)
-        self._player_bits_spin.setFixedWidth(50)
-        self._player_bits_spin.valueChanged.connect(self._on_player_display_changed)
-        r2.addWidget(self._player_bits_spin)
+        r2.addWidget(QLabel("Count(uSec):"))
+        self._player_count_usec_spin = QSpinBox()
+        self._player_count_usec_spin.setRange(1, 1000000)
+        self._player_count_usec_spin.setValue(10)
+        self._player_count_usec_spin.setFixedWidth(75)
+        self._player_count_usec_spin.setToolTip(
+            "Loop period in µs (10 = 10 µs = 100 kHz). Used for time axis.")
+        self._player_count_usec_spin.valueChanged.connect(self._on_player_time_axis_changed)
+        r2.addWidget(self._player_count_usec_spin)
         r2.addSpacing(12)
         for ch, attr in [(0, "_player_gain0_spin"), (1, "_player_gain1_spin"),
                          (2, "_player_gain2_spin")]:
             r2.addWidget(QLabel(f"Gain ch{ch}:"))
             sp = QDoubleSpinBox()
             sp.setRange(0.0, 1000.0)
-            sp.setValue(10.0)
-            sp.setSingleStep(0.5)
-            sp.setDecimals(2)
-            sp.setFixedWidth(70)
+            sp.setValue(1.0)
+            sp.setSingleStep(0.1)
+            sp.setDecimals(3)
+            sp.setFixedWidth(75)
             setattr(self, attr, sp)
             r2.addWidget(sp)
         self._player_gain0_spin.valueChanged.connect(self._on_player_display_changed)
@@ -1343,8 +1381,10 @@ class FPGAWidget(QWidget):
                 pw = pg.PlotWidget(background="w")
                 pw.setMinimumHeight(200)
                 pi = pw.getPlotItem()
-                pi.setLabel("left", "0.1 × gain × count / max")
+                pi.setLabel("left", "Arb output (gain × count)")
                 pi.setLabel("bottom", "Sample index")
+                pi.showAxis("top")
+                pi.getAxis("top").setLabel("Time")
                 pi.showGrid(x=True, y=True, alpha=0.25)
                 curve = pi.plot(pen=pg.mkPen("#059669", width=1.5),
                                 name="Waveform")
@@ -1368,7 +1408,7 @@ class FPGAWidget(QWidget):
         return grp
 
     # ------------------------------------------------------------------
-    # Outputs tab (EOM + COM + AO rotation)
+    # (Trapping tab moved to procedures/proc_trapping.py — see _build_ui)
     # ------------------------------------------------------------------
 
     def _build_outputs_tab(self) -> QWidget:
@@ -1617,18 +1657,62 @@ class FPGAWidget(QWidget):
     # Session persistence
     # ==================================================================
 
-    def _restore_session(self) -> None:
-        last = load_last_session()
-        if last is None:
+    def _restore_full_state(self) -> None:
+        """Load session_state.json and restore all GUI widget values on startup."""
+        state = _load_session_state()
+        if not state:
             return
+        self._session_state = state
         try:
-            cfg_data = last.get("config") or last
-            if "bitfile" in cfg_data:
-                self._bitfile_edit.setText(cfg_data["bitfile"])
-            if "resource" in cfg_data:
-                self._resource_edit.setText(cfg_data["resource"])
-            if "poll_interval_ms" in cfg_data:
-                self._poll_spin.setValue(int(cfg_data["poll_interval_ms"]))
+            cfg = state.get("config", {})
+            if "bitfile" in cfg:
+                self._bitfile_edit.setText(cfg["bitfile"])
+            if "resource" in cfg:
+                self._resource_edit.setText(cfg["resource"])
+            if "poll_interval_ms" in cfg:
+                self._poll_spin.setValue(int(cfg["poll_interval_ms"]))
+            for name, val in state.get("host_params", {}).items():
+                self._host_values[name] = float(val)
+                edit = self._host_edits.get(name)
+                if edit is not None:
+                    edit.setText(_fmt(float(val)))
+            if "dropper" in state:
+                self._dropper_proc.restore_ui_state(state["dropper"])
+            if "shaker" in state:
+                self._shaker_proc.restore_ui_state(state["shaker"])
+            if "trapping" in state:
+                self._trap_proc.restore_ui_state(state["trapping"])
+        except Exception as exc:
+            self._append_status(f"Session restore warning: {exc}")
+
+    def _restore_registers_from_state(self) -> None:
+        """Write FPGA registers from session_state.json (called after connect)."""
+        regs = self._session_state.get("registers", {})
+        if not regs:
+            return
+        to_write = {k: v for k, v in regs.items()
+                    if k in {r.name for r in writable_registers()}}
+        if to_write:
+            errors = self._ctrl.write_many(to_write)
+            ok = len(to_write) - len(errors)
+            self._append_status(f"Session: restored {ok}/{len(to_write)} FPGA registers")
+
+    def _gather_full_state(self) -> dict:
+        """Collect all GUI state into a dict for session_state.json."""
+        state: dict = {}
+        state["config"] = self._current_config().to_dict()
+        state["host_params"] = {k: float(v) for k, v in self._host_values.items()}
+        if self._last_register_values:
+            state["registers"] = dict(self._last_register_values)
+        state["dropper"]  = self._dropper_proc.get_ui_state()
+        state["shaker"]   = self._shaker_proc.get_ui_state()
+        state["trapping"] = self._trap_proc.get_ui_state()
+        return state
+
+    def _autosave_state(self) -> None:
+        """Periodic + on-close autosave of all GUI state to session_state.json."""
+        try:
+            _save_session_state(self._gather_full_state())
         except Exception:
             pass
 
@@ -1677,6 +1761,7 @@ class FPGAWidget(QWidget):
         self._disconnect_btn.setEnabled(True)
         self._bitfile_edit.setReadOnly(True)
         self._resource_edit.setReadOnly(True)
+        self._restore_registers_from_state()
         self._on_read_all()
 
     def _on_disconnected(self) -> None:
@@ -1728,11 +1813,19 @@ class FPGAWidget(QWidget):
         self._append_status(f"Read {len(values)} registers")
 
     def _on_registers_updated(self, values: dict) -> None:
+        self._last_register_values = values
         self._update_reg_edits(values)
         self._proc_manager.notify_fpga_update(values)
+        # Notify persistent procedures (BPD signal display in dropper/shaker tabs)
+        self._dropper_proc.on_fpga_update(values)
+        self._shaker_proc.on_fpga_update(values)
+        self._trap_proc.on_fpga_update(values)
 
     def _on_plot_data(self, values: dict) -> None:
         self._plot_widget.push_values(values)
+        # Forward fast data to the trapping panel for sliding-window RMS
+        if self._trap_proc_widget is not None:
+            self._trap_proc_widget.on_fast_data(values)
 
     def _update_reg_edits(self, values: dict[str, float],
                           initial: bool = False) -> None:
@@ -1788,11 +1881,7 @@ class FPGAWidget(QWidget):
             f"{a} Setpoint", f"DC offset {a}",
             f"{a} before Setpoint", f"Use {a} PID before",
         ]
-        # integral gain has leading space for Y/Z
-        if a == "X":
-            pid_regs += ["ig X", " ig X before"]
-        else:
-            pid_regs += [f" ig {a}", f" ig {a} before"]
+        pid_regs += [f" ig {a}", f" ig {a} before"]
         pid_values = {}
         for name in pid_regs:
             edit = self._reg_edits.get(name)
@@ -2149,12 +2238,12 @@ class FPGAWidget(QWidget):
             raw = np.loadtxt(path, delimiter=",", ndmin=2)
             if raw.ndim == 1:
                 raw = raw.reshape(-1, 1)
-            ncols = raw.shape[1]
+            ncols = min(raw.shape[1], 3)
             for i in range(3):
                 self._player_data[i] = raw[:, i].astype(float) if i < ncols else None
                 if self._player_has_plot:
                     self._player_tabs.setTabVisible(i, i < ncols)
-            self._on_player_display_changed()
+            self._on_player_display_changed()   # also calls _player_update_time_axes
             self._append_status(
                 f"Loaded {raw.shape[0]} pts × {ncols} col(s) from {path}")
         except Exception as exc:
@@ -2163,16 +2252,46 @@ class FPGAWidget(QWidget):
     def _on_player_display_changed(self, *_) -> None:
         if not self._player_has_plot:
             return
-        bits = self._player_bits_spin.value()
-        max_count = max(1, 2 ** (bits - 1) - 1)
         gain = self._player_gain0_spin.value()
-        scale = 0.1 * gain / max_count
         for data, curve in zip(self._player_data, self._player_plot_curves):
             if data is not None:
-                curve.setData(np.arange(len(data)), data * scale)
+                curve.setData(np.arange(len(data)), data * gain)
             else:
                 curve.setData([], [])
         self._on_player_update_ramp_preview()
+        self._player_update_time_axes()
+
+    def _player_update_time_axes(self) -> None:
+        """Update top (time) axis on all player plots based on Count(uSec)."""
+        if not self._player_has_plot:
+            return
+        count_usec = self._player_count_usec_spin.value()
+        sample_period_s = count_usec * 1e-6
+
+        def _fmt_t(t: float) -> str:
+            if t < 1e-6:
+                return f"{t * 1e9:.1f} ns"
+            if t < 1e-3:
+                return f"{t * 1e6:.1f} µs"
+            if t < 1.0:
+                return f"{t * 1e3:.2f} ms"
+            return f"{t:.3f} s"
+
+        for i, (pw, data) in enumerate(zip(self._player_plot_widgets,
+                                           self._player_data)):
+            if data is None:
+                continue
+            n = len(data)
+            if n == 0:
+                continue
+            ax = pw.getPlotItem().getAxis("top")
+            tick_count = 6
+            positions = [int(n * j / tick_count) for j in range(tick_count + 1)]
+            labels = [_fmt_t(p * sample_period_s) for p in positions]
+            ax.setTicks([list(zip(positions, labels))])
+
+    def _on_player_time_axis_changed(self, *_) -> None:
+        self._player_update_time_axes()
 
     def _on_player_ramp_toggled(self, checked: bool) -> None:
         self._player_ramp_end.setEnabled(checked)
@@ -2189,8 +2308,6 @@ class FPGAWidget(QWidget):
                 curve.setData([], [])
             return
         try:
-            bits = self._player_bits_spin.value()
-            max_count = max(1, 2 ** (bits - 1) - 1)
             start_gain = self._player_gain0_spin.value()
             end_gain   = self._player_ramp_end.value()
             step_gain  = self._player_ramp_step.value()
@@ -2200,8 +2317,10 @@ class FPGAWidget(QWidget):
             gain_vals = np.linspace(start_gain, end_gain, n_steps)
             col0 = self._player_data[0]
             n_buf = len(col0) if col0 is not None and len(col0) > 0 else 1
+            # Envelope in same units as display: gain * waveform_max
+            # Use gain as the amplitude scale indicator (staircase)
             env_x = np.repeat(np.arange(n_steps) * n_buf, 2)[1:-1]
-            env_y = np.repeat(gain_vals * 0.1 / 10.0, 2)[1:-1]
+            env_y = np.repeat(gain_vals, 2)[1:-1]
             for curve in self._player_ramp_curves:
                 curve.setData(env_x, env_y)
         except Exception:
@@ -3306,6 +3425,8 @@ class FPGAWidget(QWidget):
     # ==================================================================
 
     def closeEvent(self, event) -> None:
+        self._autosave_timer.stop()
+        self._autosave_state()   # final save before teardown
         self._tic_timer.stop()
         if self._tic_ctrl is not None:
             self._tic_ctrl.disconnect()
@@ -3322,6 +3443,9 @@ class FPGAWidget(QWidget):
             except Exception:
                 pass
         self._proc_manager.teardown_all()
+        self._dropper_proc.teardown()
+        self._shaker_proc.teardown()
+        self._trap_proc.teardown()
         self._ctrl.disconnect()
         super().closeEvent(event)
 

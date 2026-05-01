@@ -186,10 +186,12 @@ class _ShakeWorker(QThread):
       6. Wait dwell_s  (interruptible)
 
     Emits:
-      step_update(step_n, voltage_v, elapsed_s)   after each step
+      sweep_start(step_n)                          before each AWG trigger
+      step_update(step_n, voltage_v, elapsed_s)   after AWG off + PSU ramp, before dwell
       finished(ok, message)                        on completion or stop
     """
 
+    sweep_start = pyqtSignal(int)                  # step number, before AWG on
     step_update = pyqtSignal(int, float, float)   # step, voltage_v, elapsed_s
     finished    = pyqtSignal(bool, str)
 
@@ -264,6 +266,7 @@ class _ShakeWorker(QThread):
                         return
 
                     # 1. AWG trigger
+                    self.sweep_start.emit(i + 1)
                     if not awg.output_on(self._ch):
                         self.finished.emit(False, f"AWG output_on failed at step {i+1}")
                         return
@@ -335,6 +338,7 @@ class ShakeDropperWidget(QWidget):
         self._shake_logger  = ShakeEventLogger()
         self._last_step     = 0
         self._last_voltage  = 0.0
+        self._shake_event_cb = None   # set by trapping panel via set_shake_event_callback
 
         self._build_ui()
         self._load_last_session()
@@ -869,6 +873,8 @@ class ShakeDropperWidget(QWidget):
         self._volt_lbl.setText(f"{start:.2f} V")
         self._elapsed_lbl.setText("0.0 s")
 
+        if self._shake_event_cb:
+            self._shake_event_cb("start")
         self._shake_logger.start(amplitude_vpp=start, step=0)
         total_s = n * (awg_cfg["sweep_time_s"] + dwell)
         self._log(
@@ -891,12 +897,19 @@ class ShakeDropperWidget(QWidget):
             start_freq   = awg_cfg["start_freq_hz"],
             stop_freq    = awg_cfg["stop_freq_hz"],
         )
+        shake_worker.sweep_start.connect(self._on_sweep_start)
         shake_worker.step_update.connect(self._on_step_update)
         shake_worker.finished.connect(self._on_shake_done)
         shake_worker.start()
         self._shake_worker = shake_worker
 
+    def _on_sweep_start(self, step_n: int) -> None:
+        if self._shake_event_cb:
+            self._shake_event_cb("sweep_start")
+
     def _on_step_update(self, step_n: int, voltage_v: float, elapsed_s: float) -> None:
+        if self._shake_event_cb:
+            self._shake_event_cb("step")
         n = self._n_steps_spin.value()
         self._step_lbl.setText(f"{step_n} / {n}")
         self._volt_lbl.setText(f"{voltage_v:.2f} V")
@@ -914,6 +927,8 @@ class ShakeDropperWidget(QWidget):
             self._shake_worker.stop()
 
     def _on_shake_done(self, ok: bool, msg: str) -> None:
+        if self._shake_event_cb:
+            self._shake_event_cb("done")
         self._shake_logger.stop(
             amplitude_vpp=self._last_voltage, step=self._last_step
         )
@@ -956,6 +971,70 @@ class ShakeDropperWidget(QWidget):
             )
 
     # ------------------------------------------------------------------
+    # Public API for trapping panel
+    # ------------------------------------------------------------------
+
+    def set_shake_event_callback(self, fn) -> None:
+        """Register a callable(event_type) called on 'start', 'step', 'done'."""
+        self._shake_event_cb = fn
+
+    def request_stop(self) -> None:
+        """Stop shaking (safe to call on the main thread)."""
+        self._on_stop()
+
+    def start_shaking_public(self, start_v: float, step_v: float,
+                             n_steps: int, dwell_s: float,
+                             max_v: float) -> bool:
+        """Start shaking with given params. Returns False if not connected."""
+        if not (self._awg_connected and self._psu_connected):
+            return False
+        self._start_v_spin.setValue(start_v)
+        self._step_v_spin.setValue(step_v)
+        self._n_steps_spin.setValue(n_steps)
+        self._dwell_spin.setValue(dwell_s)
+        self._max_v_spin.setValue(max_v)
+        self._on_start()
+        return True
+
+    # ------------------------------------------------------------------
+    # Session state
+    # ------------------------------------------------------------------
+
+    def get_ui_state(self) -> dict:
+        """Return all spinbox values for unified session state persistence."""
+        return {
+            "start_v":         self._start_v_spin.value(),
+            "step_v":          self._step_v_spin.value(),
+            "n_steps":         self._n_steps_spin.value(),
+            "dwell_s":         self._dwell_spin.value(),
+            "max_v":           self._max_v_spin.value(),
+            "start_freq_khz":  self._start_freq_spin.value(),
+            "stop_freq_khz":   self._stop_freq_spin.value(),
+            "sweep_time_s":    self._sweep_time_spin.value(),
+            "carrier_amp_vpp": self._carrier_amp_spin.value(),
+            "channel":         self._channel_spin.value(),
+        }
+
+    def restore_ui_state(self, state: dict) -> None:
+        """Restore spinbox values from a unified session state dict."""
+        def _s(attr, key, cast=float):
+            if key in state:
+                try:
+                    getattr(self, attr).setValue(cast(state[key]))
+                except Exception:
+                    pass
+        _s("_start_v_spin",     "start_v")
+        _s("_step_v_spin",      "step_v")
+        _s("_n_steps_spin",     "n_steps", int)
+        _s("_dwell_spin",       "dwell_s")
+        _s("_max_v_spin",       "max_v")
+        _s("_start_freq_spin",  "start_freq_khz")
+        _s("_stop_freq_spin",   "stop_freq_khz")
+        _s("_sweep_time_spin",  "sweep_time_s")
+        _s("_carrier_amp_spin", "carrier_amp_vpp")
+        _s("_channel_spin",     "channel", int)
+
+    # ------------------------------------------------------------------
     # Cleanup
     # ------------------------------------------------------------------
 
@@ -973,6 +1052,7 @@ class ShakeDropperWidget(QWidget):
 
 class Procedure(ControlProcedure):
     NAME        = "Shake Dropper"
+    PERSISTENT  = True   # always loaded as a dedicated tab; excluded from Procedures list
     DESCRIPTION = (
         "Stage 5 — Dropper shaking. "
         "The Keysight 33500B AWG drives a MOSFET gate with a fixed frequency sweep "
@@ -991,6 +1071,15 @@ class Procedure(ControlProcedure):
     def on_fpga_update(self, state: dict[str, float]) -> None:
         if self._widget is not None:
             self._widget.on_fpga_update(state)
+
+    def get_ui_state(self) -> dict:
+        if self._widget is not None:
+            return self._widget.get_ui_state()
+        return {}
+
+    def restore_ui_state(self, state: dict) -> None:
+        if self._widget is not None:
+            self._widget.restore_ui_state(state)
 
     def teardown(self) -> None:
         if self._widget is not None:

@@ -44,3 +44,16 @@ Thumbs.db
 
 # Logs
 *.log
+
+# Runtime session / IPC state (auto-generated, not source)
+session_state.json
+fpga_session_log.jsonl
+fpga_snapshot_*.json
+ipc/*.json
+ipc/*.jsonl
+
+# Waveform data files
+waveforms/
+
+# Backup / scratch copies in docs
+docs/*.py
