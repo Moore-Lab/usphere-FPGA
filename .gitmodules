@@ -7,6 +7,15 @@
 [submodule "resources/Microsphere-Utility-Scripts"]
 	path = resources/Microsphere-Utility-Scripts
 	url = https://github.com/Moore-Lab/Microsphere-Utility-Scripts
-[submodule "resources/usphere-DAQ"]
-	path = resources/usphere-DAQ
-	url = https://github.com/Moore-Lab/usphere-DAQ
+[submodule "resources/TENMA_72-XXXX"]
+	path = resources/TENMA_72-XXXX
+	url = https://github.com/Moore-Lab/TENMA_72-XXXX
+[submodule "resources/kcube-motor-controller"]
+	path = resources/kcube-motor-controller
+	url = https://github.com/Moore-Lab/kcube-motor-controller
+[submodule "resources/Solenoid-valve-controller"]
+	path = resources/Solenoid-valve-controller
+	url = https://github.com/Moore-Lab/Solenoid-valve-controller
+[submodule "resources/IdealVac-CommandValve"]
+	path = resources/IdealVac-CommandValve
+	url = https://github.com/Moore-Lab/IdealVac-CommandValve

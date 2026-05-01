@@ -4,24 +4,14 @@ modules/mod_dropper_stage.py
 Hardware module for the dropper translation stage:
   Thorlabs Z812 linear actuator + KDC101 KCube DC Servo Motor Controller.
 
-Communicates via USB using the Thorlabs Kinesis SDK, wrapped by pylablib.
+Core logic lives in the git submodule at:
+  resources/kcube-motor-controller/
 
-Dependencies
-------------
-  pip install pylablib
-  Kinesis software must be installed (provides the backend DLLs):
-  https://www.thorlabs.com/software_pages/ViewSoftwarePage.cfm?Code=Motion_Control
-
-Module protocol
----------------
-  MODULE_NAME   "DROPPER_STAGE"
-  DEVICE_NAME   "Dropper Stage (Z812 / KDC101)"
-  CONFIG_FIELDS serial number, three named preset positions, motion params
-  DEFAULTS      position_mm, is_homed, is_moving
-  read(config)  return current position and status flags
-  test(config)  connect, read, report
-  command(config, action, **kwargs)
-                home | move_to | move_to_preset | jog
+This module is a lightweight wrapper that:
+  1. Adds the submodule to sys.path so KCubeController is importable.
+  2. Exposes the standard usphere module protocol (read / test / command).
+  3. Persists the last known position to a state file in ipc/ so the GUI
+     can display it on boot before homing resets the encoder.
 
 Named preset positions
 ----------------------
@@ -29,40 +19,32 @@ Named preset positions
   dropping   (~6.5 mm)  — aperture aligned with beam; spheres fall into trap
   retraction (~11.0 mm) — coverslip clear of trapping beam; used after trapping
 
-These are stored in config (editable in the GUI) and are stable across hardware
-swaps for a given optical alignment.  If a different dropper module is installed
-the "dropping" position may shift by ~1 mm and should be re-dialled in.
-
-State file (dropper_stage_state.json, same directory as this module)
-Records last_position_mm after each commanded move so the GUI can display the
-last known position on boot — before homing resets the encoder.
-
 Motor parameter handling
 ------------------------
-On connect, the KDC101 already holds its last-configured values for velocity,
-acceleration, jog step size, and backlash (stored in the controller's
-non-volatile memory by the Kinesis GUI or a previous session).  Config values
-of 0.0 mean "keep the device's current setting".  Non-zero values override.
-This means the first time the controller is used you can leave everything at
-0.0 and get sensible defaults; only change what you actually want to tune.
-
-Typical operating values: velocity 1 mm/s, acceleration 1 mm/s².
-The Z812 travel range is 0–12 mm.
+Config values of 0.0 mean "keep the device's current setting".
+Non-zero values override.  See KCubeController.apply_motion_params().
 """
 
 from __future__ import annotations
 
-import contextlib
 import datetime
 import json
-import time
+import sys
 from pathlib import Path
 
+# ---------------------------------------------------------------------------
+# Ensure the submodule is importable
+# ---------------------------------------------------------------------------
+
+_SUBMODULE_DIR = Path(__file__).parent.parent / "resources" / "kcube-motor-controller"
+if _SUBMODULE_DIR.exists() and str(_SUBMODULE_DIR) not in sys.path:
+    sys.path.insert(0, str(_SUBMODULE_DIR))
+
 try:
-    from pylablib.devices import Thorlabs
-    PYLABLIB_AVAILABLE = True
+    from kcube_controller import KCubeController
+    CONTROLLER_AVAILABLE = True
 except ImportError:
-    PYLABLIB_AVAILABLE = False
+    CONTROLLER_AVAILABLE = False
 
 
 # ---------------------------------------------------------------------------
@@ -71,10 +53,6 @@ except ImportError:
 
 MODULE_NAME = "DROPPER_STAGE"
 DEVICE_NAME = "Dropper Stage (Z812 / KDC101)"
-
-# Physical travel range of the Z812 (used for input validation)
-_Z812_MIN_MM = 0.0
-_Z812_MAX_MM = 12.0
 
 
 # ---------------------------------------------------------------------------
@@ -88,7 +66,6 @@ CONFIG_FIELDS: list[dict] = [
         "type":    "text",
         "default": "27006288",
     },
-    # --- Named preset positions ---
     {
         "key":     "retrieval_mm",
         "label":   "Retrieval position (mm)",
@@ -110,7 +87,6 @@ CONFIG_FIELDS: list[dict] = [
         "default": 11.0,
         "tooltip": "Coverslip clear of trapping beam; used after a sphere is trapped",
     },
-    # --- Motion parameters (0.0 = keep device default) ---
     {
         "key":     "velocity_mm_s",
         "label":   "Velocity (mm/s)",
@@ -156,7 +132,6 @@ DEFAULTS: dict = {
     KEY_IS_MOVING: 0.0,
 }
 
-# Map preset name → config key → fallback default
 _PRESETS: dict[str, tuple[str, float]] = {
     "retrieval":  ("retrieval_mm",  5.0),
     "dropping":   ("dropping_mm",   6.5),
@@ -168,7 +143,7 @@ _PRESETS: dict[str, tuple[str, float]] = {
 # State file — persists last known position across restarts
 # ---------------------------------------------------------------------------
 
-_STATE_FILE = Path(__file__).parent / "dropper_stage_state.json"
+_STATE_FILE = Path(__file__).parent.parent / "ipc" / "dropper_stage_state.json"
 
 
 def _load_state() -> dict:
@@ -179,6 +154,7 @@ def _load_state() -> dict:
 
 
 def _save_state(position_mm: float, note: str = "") -> None:
+    _STATE_FILE.parent.mkdir(exist_ok=True)
     state = _load_state()
     state["last_position_mm"] = round(position_mm, 6)
     state["last_updated"]     = datetime.datetime.now().isoformat()
@@ -196,51 +172,22 @@ def get_last_position() -> float | None:
 # Internal helpers
 # ---------------------------------------------------------------------------
 
-@contextlib.contextmanager
-def _open(serial_number: str):
-    """Open a KinesisMotor for the Z812 and yield it after a brief settle.
-
-    The KDC101 communicates over USB-serial.  Rapid open/close cycles can
-    leave stale bytes in the OS buffer that are then mis-read as the start
-    of the next response message, producing a "message sync error".  The
-    100 ms sleep after opening gives the driver time to drain any residual
-    data before the first command is sent.
-    """
-    with Thorlabs.KinesisMotor(serial_number, scale="Z812") as motor:
-        time.sleep(0.1)
-        yield motor
-
-
-def _apply_motion_params(stage, config: dict) -> None:
-    """
-    Push velocity / acceleration / jog step / backlash to the controller.
-    Values of 0.0 in config are skipped, preserving whatever is in the device.
-    """
-    vel  = float(config.get("velocity_mm_s",      0.0))
-    acc  = float(config.get("acceleration_mm_s2", 0.0))
-    jog  = float(config.get("jog_step_mm",        0.0))
-    blsh = float(config.get("backlash_mm",        0.0))
-
-    # pylablib passes None through as "keep current value"
-    if vel > 0 or acc > 0:
-        stage.setup_velocity(
-            max_velocity=vel if vel > 0 else None,
-            acceleration=acc if acc > 0 else None,
+def _make_ctrl(config: dict) -> KCubeController:
+    if not CONTROLLER_AVAILABLE:
+        raise RuntimeError(
+            "KCubeController not found. "
+            f"Expected submodule at: {_SUBMODULE_DIR}"
         )
-
-    if jog > 0:
-        stage.setup_jog(step_size=jog)
-
-    if blsh > 0:
-        stage.set_backlash(blsh)
+    return KCubeController(config.get("serial_number", CONFIG_FIELDS[0]["default"]))
 
 
-def _validate_position(position_mm: float) -> None:
-    if not (_Z812_MIN_MM <= position_mm <= _Z812_MAX_MM):
-        raise ValueError(
-            f"Position {position_mm:.4f} mm is outside Z812 travel range "
-            f"({_Z812_MIN_MM}–{_Z812_MAX_MM} mm)"
-        )
+def _apply_params(ctrl: KCubeController, config: dict) -> None:
+    ctrl.apply_motion_params(
+        velocity     = float(config.get("velocity_mm_s",      0.0)),
+        acceleration = float(config.get("acceleration_mm_s2", 0.0)),
+        jog_step     = float(config.get("jog_step_mm",        0.0)),
+        backlash     = float(config.get("backlash_mm",        0.0)),
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -248,41 +195,21 @@ def _validate_position(position_mm: float) -> None:
 # ---------------------------------------------------------------------------
 
 def read(config: dict) -> dict:
-    """
-    Connect to the KDC101, read position and status flags, then disconnect.
-
-    Parameters
-    ----------
-    config : dict with at minimum "serial_number"
-
-    Returns
-    -------
-    dict
-        position_mm : float — current position in mm
-        is_homed    : float — 1.0 if the stage has been homed, 0.0 otherwise
-        is_moving   : float — 1.0 if a move is in progress
-
-    Raises
-    ------
-    RuntimeError    if pylablib is not installed
-    Exception       on any Kinesis communication error
-    """
-    if not PYLABLIB_AVAILABLE:
-        raise RuntimeError("pylablib not installed — run: pip install pylablib")
-
-    sn = config.get("serial_number", CONFIG_FIELDS[0]["default"])
-
-    with _open(sn) as stage:
-        position  = stage.get_position()
-        status    = stage.get_status()
-        is_homed  = 1.0 if "homed" in status else 0.0
-        is_moving = 1.0 if stage.is_moving() else 0.0
-
-    return {
-        KEY_POSITION:  float(position),
-        KEY_IS_HOMED:  is_homed,
-        KEY_IS_MOVING: is_moving,
-    }
+    """Connect, read position and status flags, disconnect."""
+    ctrl = _make_ctrl(config)
+    if not ctrl.connect():
+        raise ConnectionError(
+            f"Could not connect to dropper stage S/N '{config.get('serial_number')}'."
+        )
+    try:
+        s = ctrl.get_status()
+        return {
+            KEY_POSITION:  s["position_mm"],
+            KEY_IS_HOMED:  1.0 if s["is_homed"]  else 0.0,
+            KEY_IS_MOVING: 1.0 if s["is_moving"] else 0.0,
+        }
+    finally:
+        ctrl.disconnect()
 
 
 # ---------------------------------------------------------------------------
@@ -290,18 +217,14 @@ def read(config: dict) -> dict:
 # ---------------------------------------------------------------------------
 
 def test(config: dict) -> tuple[bool, str]:
-    """
-    Connect, read position and status, report.  Safe to call from a worker thread.
-    """
+    """Connect, read position and status, report.  Safe to call from a worker thread."""
     try:
         vals = read(config)
         pos       = vals[KEY_POSITION]
         homed_str = "yes" if vals[KEY_IS_HOMED] else "no"
         last      = get_last_position()
         last_str  = f"  |  last saved: {last:.4f} mm" if last is not None else ""
-        return True, (
-            f"OK — position: {pos:.4f} mm  |  homed: {homed_str}{last_str}"
-        )
+        return True, f"OK — position: {pos:.4f} mm  |  homed: {homed_str}{last_str}"
     except RuntimeError as exc:
         return False, str(exc)
     except Exception as exc:
@@ -318,130 +241,95 @@ def command(config: dict, **kwargs) -> dict:
 
     Parameters
     ----------
-    config : standard config dict (serial_number, preset positions, motion params)
+    config : standard config dict
     **kwargs:
-        action : str — one of "home", "move_to", "move_to_preset", "jog"
+        action : str — "home" | "move_to" | "move_to_preset" | "jog"
 
         For action="move_to":
-            position_mm : float — target absolute position in mm
+            position_mm : float
 
         For action="move_to_preset":
-            preset : str — "retrieval", "dropping", or "retraction"
+            preset : str — "retrieval" | "dropping" | "retraction"
 
         For action="jog":
             direction : str — "forward" (default) or "reverse"
-            step_mm   : float (optional) — override jog_step_mm from config
+            step_mm   : float (optional) — overrides jog_step_mm from config
 
     Returns
     -------
     dict
         ok          : bool
         message     : str
-        position_mm : float (position after move; 0.0 if unavailable)
+        position_mm : float
     """
-    if not PYLABLIB_AVAILABLE:
+    action = kwargs.get("action", "")
+
+    try:
+        ctrl = _make_ctrl(config)
+    except RuntimeError as exc:
+        return {"ok": False, "message": str(exc), "position_mm": 0.0}
+
+    if not ctrl.connect():
         return {
             "ok": False,
-            "message": "pylablib not installed — run: pip install pylablib",
+            "message": f"Could not connect to stage S/N '{config.get('serial_number')}'.",
             "position_mm": 0.0,
         }
 
-    action = kwargs.get("action", "")
-    sn     = config.get("serial_number", CONFIG_FIELDS[0]["default"])
-
     try:
-        with _open(sn) as stage:
-            _apply_motion_params(stage, config)
+        _apply_params(ctrl, config)
 
-            # ---- home ----
-            if action == "home":
-                stage.home(sync=True, timeout=60.0)
-                pos = stage.get_position()
-                _save_state(pos, note="homed")
-                return {
-                    "ok": True,
-                    "message": f"Homed successfully. Position: {pos:.4f} mm",
-                    "position_mm": float(pos),
-                }
+        if action == "home":
+            pos = ctrl.home()
+            _save_state(pos, note="homed")
+            return {"ok": True, "message": f"Homed. Position: {pos:.4f} mm", "position_mm": pos}
 
-            # ---- move to absolute position ----
-            elif action == "move_to":
-                target = float(kwargs["position_mm"])
-                _validate_position(target)
-                stage.move_to(target, sync=True, timeout=60.0)
-                pos = stage.get_position()
-                _save_state(pos, note=f"move_to {target:.4f} mm")
-                return {
-                    "ok": True,
-                    "message": f"Moved to {pos:.4f} mm",
-                    "position_mm": float(pos),
-                }
+        elif action == "move_to":
+            target = float(kwargs["position_mm"])
+            pos = ctrl.move_to(target)
+            _save_state(pos, note=f"move_to {target:.4f} mm")
+            return {"ok": True, "message": f"Moved to {pos:.4f} mm", "position_mm": pos}
 
-            # ---- move to named preset ----
-            elif action == "move_to_preset":
-                preset = kwargs.get("preset", "")
-                if preset not in _PRESETS:
-                    return {
-                        "ok": False,
-                        "message": (
-                            f"Unknown preset {preset!r}. "
-                            f"Valid presets: {list(_PRESETS)}"
-                        ),
-                        "position_mm": 0.0,
-                    }
-                cfg_key, fallback = _PRESETS[preset]
-                target = float(config.get(cfg_key, fallback))
-                _validate_position(target)
-                stage.move_to(target, sync=True, timeout=60.0)
-                pos = stage.get_position()
-                _save_state(pos, note=f"preset:{preset}")
-                return {
-                    "ok": True,
-                    "message": f"At '{preset}': {pos:.4f} mm",
-                    "position_mm": float(pos),
-                }
-
-            # ---- jog ----
-            elif action == "jog":
-                direction = kwargs.get("direction", "forward")
-                # Allow per-call step override; fall back to config
-                step = float(kwargs.get("step_mm", config.get("jog_step_mm", 0.1)))
-                if direction not in ("forward", "reverse"):
-                    return {
-                        "ok": False,
-                        "message": f"Unknown jog direction {direction!r}. "
-                                   "Use 'forward' or 'reverse'.",
-                        "position_mm": 0.0,
-                    }
-                signed_step = step if direction == "forward" else -step
-                current = stage.get_position()
-                target  = current + signed_step
-                _validate_position(target)
-                stage.move_by(signed_step, sync=True, timeout=30.0)
-                pos = stage.get_position()
-                _save_state(pos, note=f"jog {signed_step:+.4f} mm")
-                return {
-                    "ok": True,
-                    "message": f"Jogged {signed_step:+.4f} mm → {pos:.4f} mm",
-                    "position_mm": float(pos),
-                }
-
-            else:
+        elif action == "move_to_preset":
+            preset = kwargs.get("preset", "")
+            if preset not in _PRESETS:
                 return {
                     "ok": False,
-                    "message": (
-                        f"Unknown action {action!r}. "
-                        "Valid actions: home, move_to, move_to_preset, jog"
-                    ),
+                    "message": f"Unknown preset {preset!r}. Valid: {list(_PRESETS)}",
                     "position_mm": 0.0,
                 }
+            cfg_key, fallback = _PRESETS[preset]
+            target = float(config.get(cfg_key, fallback))
+            pos = ctrl.move_to(target)
+            _save_state(pos, note=f"preset:{preset}")
+            return {"ok": True, "message": f"At '{preset}': {pos:.4f} mm", "position_mm": pos}
+
+        elif action == "jog":
+            direction = kwargs.get("direction", "forward")
+            step = float(kwargs.get("step_mm", config.get("jog_step_mm", 0.1)))
+            pos = ctrl.jog(direction=direction, step_mm=step)
+            _save_state(pos, note=f"jog {direction} {step:.4f} mm")
+            return {
+                "ok": True,
+                "message": f"Jogged {direction} {step:.4f} mm → {pos:.4f} mm",
+                "position_mm": pos,
+            }
+
+        else:
+            return {
+                "ok": False,
+                "message": f"Unknown action {action!r}. Valid: home, move_to, move_to_preset, jog",
+                "position_mm": 0.0,
+            }
 
     except KeyError as exc:
         return {"ok": False, "message": f"Missing parameter: {exc}", "position_mm": 0.0}
-    except ValueError as exc:
+    except (ValueError, RuntimeError) as exc:
         return {"ok": False, "message": str(exc), "position_mm": 0.0}
     except Exception as exc:
         return {"ok": False, "message": f"{type(exc).__name__}: {exc}", "position_mm": 0.0}
+    finally:
+        ctrl.disconnect()
 
 
 # ---------------------------------------------------------------------------
@@ -449,11 +337,11 @@ def command(config: dict, **kwargs) -> dict:
 # ---------------------------------------------------------------------------
 
 if __name__ == "__main__":
-    import sys
+    import sys as _sys
 
     cfg = {f["key"]: f["default"] for f in CONFIG_FIELDS}
-    if len(sys.argv) > 1:
-        cfg["serial_number"] = sys.argv[1]
+    if len(_sys.argv) > 1:
+        cfg["serial_number"] = _sys.argv[1]
 
     sn = cfg["serial_number"]
     print(f"Testing {DEVICE_NAME}  S/N {sn} ...")
@@ -466,24 +354,24 @@ if __name__ == "__main__":
         print(f"Last saved position: {last:.4f} mm")
 
     if not ok:
-        sys.exit(1)
+        _sys.exit(1)
 
     print("\nAvailable commands:")
     print("  python mod_dropper_stage.py <sn> home")
     print("  python mod_dropper_stage.py <sn> retrieval")
     print("  python mod_dropper_stage.py <sn> dropping")
     print("  python mod_dropper_stage.py <sn> retraction")
+    print("  python mod_dropper_stage.py <sn> <position_mm>")
 
-    if len(sys.argv) > 2:
-        action_arg = sys.argv[2]
-        if action_arg == "home":
+    if len(_sys.argv) > 2:
+        arg = _sys.argv[2]
+        if arg == "home":
             result = command(cfg, action="home")
-        elif action_arg in _PRESETS:
-            result = command(cfg, action="move_to_preset", preset=action_arg)
+        elif arg in _PRESETS:
+            result = command(cfg, action="move_to_preset", preset=arg)
         else:
             try:
-                target = float(action_arg)
-                result = command(cfg, action="move_to", position_mm=target)
+                result = command(cfg, action="move_to", position_mm=float(arg))
             except ValueError:
-                result = {"ok": False, "message": f"Unrecognised argument: {action_arg}"}
+                result = {"ok": False, "message": f"Unrecognised argument: {arg}"}
         print(f"{'OK' if result['ok'] else 'FAILED'}: {result['message']}")

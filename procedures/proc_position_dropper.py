@@ -401,6 +401,34 @@ class DropperStageWidget(QWidget):
             "backlash_mm":        self._blsh_spin.value(),
         }
 
+    def get_ui_state(self) -> dict:
+        """Return all widget values for unified session state persistence."""
+        return self._get_config()
+
+    def restore_ui_state(self, state: dict) -> None:
+        """Restore widget values from a unified session state dict."""
+        def _s(attr, key, cast=float):
+            if key in state:
+                try:
+                    getattr(self, attr).setValue(cast(state[key]))
+                except Exception:
+                    pass
+        if "serial_number" in state:
+            self._sn_edit.setText(str(state["serial_number"]))
+        _s("_preset_spins", "retrieval_mm")   # handled below
+        for name, key in [("retrieval", "retrieval_mm"),
+                          ("dropping",  "dropping_mm"),
+                          ("retraction","retraction_mm")]:
+            if key in state:
+                try:
+                    self._preset_spins[name].setValue(float(state[key]))
+                except Exception:
+                    pass
+        _s("_vel_spin",  "velocity_mm_s")
+        _s("_acc_spin",  "acceleration_mm_s2")
+        _s("_jog_spin",  "jog_step_mm")
+        _s("_blsh_spin", "backlash_mm")
+
     def _set_buttons_enabled(self, enabled: bool) -> None:
         """Enable or disable all command buttons."""
         for btn in self._preset_btns.values():
@@ -517,6 +545,10 @@ class DropperStageWidget(QWidget):
         self._log(f"Moving to preset '{preset}' ({target:.4f} mm)…")
         self._run_command("move_to_preset", preset=preset)
 
+    def move_preset_public(self, preset: str) -> None:
+        """Move to a named preset — callable from other panels (e.g. trapping tab)."""
+        self._move_preset(preset)
+
     def _on_jog(self, direction: str) -> None:
         step = self._jog_spin.value()
         self._log(f"Jog {direction} {step:.3f} mm…")
@@ -567,6 +599,7 @@ class DropperStageWidget(QWidget):
 
 class Procedure(ControlProcedure):
     NAME        = "Dropper Stage"
+    PERSISTENT  = True   # always loaded as a dedicated tab; excluded from Procedures list
     DESCRIPTION = (
         "Control the Z812 linear actuator (KDC101) for dropper positioning. "
         "Move to retrieval, dropping, or retraction presets; home; jog. "
@@ -583,6 +616,15 @@ class Procedure(ControlProcedure):
     def on_fpga_update(self, state: dict[str, float]) -> None:
         if self._widget is not None:
             self._widget.on_fpga_update(state)
+
+    def get_ui_state(self) -> dict:
+        if self._widget is not None:
+            return self._widget.get_ui_state()
+        return {}
+
+    def restore_ui_state(self, state: dict) -> None:
+        if self._widget is not None:
+            self._widget.restore_ui_state(state)
 
     def teardown(self) -> None:
         if self._widget is not None:

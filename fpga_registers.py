@@ -49,6 +49,7 @@ class RegisterDef:
     access: Access = Access.RW
     is_bool: bool = False
     is_integer: bool = False   # True for I8/U8/I16/U16/I32/U32/I64/U64 FPGA types
+    n_elements: int = 1        # >1 for FXP array registers (HP/LP/Notch coeff arrays)
     description: str = ""
 
 
@@ -61,7 +62,7 @@ REGISTERS: list[RegisterDef] = [
     # --- Status / timing ---
     RegisterDef("Stop",                   Category.STATUS, Access.RW, is_bool=True, description="Stop FPGA loop"),
     RegisterDef("FPGA Error Out",         Category.STATUS, Access.READ, description="Error indicator from FPGA"),
-    RegisterDef("Count(uSec)",            Category.STATUS, Access.READ, is_integer=True, description="Microsecond tick counter"),
+    RegisterDef("Count(uSec)",            Category.STATUS, Access.RW,   is_integer=True, description="Microsecond tick counter (sets loop period; 10 = 100 kHz)"),
 
     # --- Z axis ---
     # Setpoints, gains, offsets, limits: I32 in LabVIEW VI (integer writes required)
@@ -85,18 +86,18 @@ REGISTERS: list[RegisterDef] = [
     RegisterDef("Z before Setpoint",      Category.Z_AXIS, is_integer=True, description="Z before-chamber setpoint"),
     RegisterDef("AI Z before chamber plot", Category.Z_AXIS, Access.READ, description="Z sensor before chamber"),
     RegisterDef("Use Z PID before",       Category.Z_AXIS, is_bool=True, description="Enable before-chamber PID Z"),
-    RegisterDef("HP Coeff Z",             Category.Z_AXIS, description="High-pass filter coeff Z"),
-    RegisterDef("HP Coeff Z before",      Category.Z_AXIS, description="High-pass filter coeff Z (before)"),
+    RegisterDef("HP Coeff Z",             Category.Z_AXIS, n_elements=2, description="High-pass filter coeff Z"),
+    RegisterDef("HP Coeff Z before",      Category.Z_AXIS, n_elements=2, description="High-pass filter coeff Z (before)"),
     RegisterDef("dg band Z",              Category.Z_AXIS, description="Derivative bandpass gain Z"),
     RegisterDef("dg band Z before",       Category.Z_AXIS, description="Derivative bandpass gain Z (before)"),
-    RegisterDef("HP Coeff band Z",        Category.Z_AXIS, description="HP bandpass coeff Z"),
-    RegisterDef("LP Coeff band Z",        Category.Z_AXIS, description="LP bandpass coeff Z"),
-    RegisterDef("LP Coeff band Z before", Category.Z_AXIS, description="LP bandpass coeff Z (before)"),
-    RegisterDef("HP coeff band Z before", Category.Z_AXIS, description="HP bandpass coeff Z (before)"),
-    RegisterDef("LP Coeff Z",             Category.Z_AXIS, description="Low-pass filter coeff Z"),
-    RegisterDef("LP Coeff Z before",      Category.Z_AXIS, description="Low-pass filter coeff Z (before)"),
-    RegisterDef("final filter coeff Z",   Category.Z_AXIS, description="Final output filter Z"),
-    RegisterDef("final filter coeff Z before", Category.Z_AXIS, description="Final output filter Z (before)"),
+    RegisterDef("HP Coeff band Z",        Category.Z_AXIS, n_elements=6, description="HP bandpass coeff Z"),
+    RegisterDef("LP Coeff band Z",        Category.Z_AXIS, n_elements=6, description="LP bandpass coeff Z"),
+    RegisterDef("LP Coeff band Z before", Category.Z_AXIS, n_elements=6, description="LP bandpass coeff Z (before)"),
+    RegisterDef("HP coeff band Z before", Category.Z_AXIS, n_elements=6, description="HP bandpass coeff Z (before)"),
+    RegisterDef("LP Coeff Z",             Category.Z_AXIS, n_elements=2, description="Low-pass filter coeff Z"),
+    RegisterDef("LP Coeff Z before",      Category.Z_AXIS, n_elements=2, description="Low-pass filter coeff Z (before)"),
+    RegisterDef("final filter coeff Z",   Category.Z_AXIS, n_elements=6, description="Final output filter Z"),
+    RegisterDef("final filter coeff Z before", Category.Z_AXIS, n_elements=6, description="Final output filter Z (before)"),
     RegisterDef("Lower lim Z before",     Category.Z_AXIS, is_integer=True, description="Lower limit Z (before chamber)"),
     RegisterDef("Upper lim Z before",     Category.Z_AXIS, is_integer=True, description="Upper limit Z (before chamber)"),
     RegisterDef("activate COMz",          Category.Z_AXIS, is_bool=True, description="Activate COM Z output"),
@@ -106,10 +107,10 @@ REGISTERS: list[RegisterDef] = [
     RegisterDef("accum out z1",           Category.Z_AXIS, Access.READ, description="Accumulator z1 output"),
     RegisterDef("accurrm reset z2",       Category.Z_AXIS, is_bool=True, description="Reset accumulator z2"),
     RegisterDef("accum out z2",           Category.Z_AXIS, Access.READ, description="Accumulator z2 output"),
-    RegisterDef("Notch coeff z 1",        Category.Z_AXIS, description="Notch filter 1 coeff Z"),
-    RegisterDef("Notch coeff z 2",        Category.Z_AXIS, description="Notch filter 2 coeff Z"),
-    RegisterDef("Notch coeff z 3",        Category.Z_AXIS, description="Notch filter 3 coeff Z"),
-    RegisterDef("Notch coeff z 4",        Category.Z_AXIS, description="Notch filter 4 coeff Z"),
+    RegisterDef("Notch coeff z 1",        Category.Z_AXIS, n_elements=3, description="Notch filter 1 coeff Z"),
+    RegisterDef("Notch coeff z 2",        Category.Z_AXIS, n_elements=3, description="Notch filter 2 coeff Z"),
+    RegisterDef("Notch coeff z 3",        Category.Z_AXIS, n_elements=3, description="Notch filter 3 coeff Z"),
+    RegisterDef("Notch coeff z 4",        Category.Z_AXIS, n_elements=3, description="Notch filter 4 coeff Z"),
 
     # --- Y axis ---
     RegisterDef("Y Setpoint",             Category.Y_AXIS, is_integer=True, description="Y feedback setpoint"),
@@ -129,27 +130,27 @@ REGISTERS: list[RegisterDef] = [
     RegisterDef("Y before Setpoint",      Category.Y_AXIS, is_integer=True, description="Y before-chamber setpoint"),
     RegisterDef("AI Y before chamber plot", Category.Y_AXIS, Access.READ, description="Y sensor before chamber"),
     RegisterDef("Use Y PID before",       Category.Y_AXIS, is_bool=True, description="Enable before-chamber PID Y"),
-    RegisterDef("HP Coeff Y",             Category.Y_AXIS, description="High-pass filter coeff Y"),
-    RegisterDef("HP Coeff Y before",      Category.Y_AXIS, description="High-pass filter coeff Y (before)"),
+    RegisterDef("HP Coeff Y",             Category.Y_AXIS, n_elements=2, description="High-pass filter coeff Y"),
+    RegisterDef("HP Coeff Y before",      Category.Y_AXIS, n_elements=2, description="High-pass filter coeff Y (before)"),
     RegisterDef("dg band Y",              Category.Y_AXIS, description="Derivative bandpass gain Y"),
     RegisterDef("dg band Y before",       Category.Y_AXIS, description="Derivative bandpass gain Y (before)"),
-    RegisterDef("HP Coeff band Y",        Category.Y_AXIS, description="HP bandpass coeff Y"),
-    RegisterDef("LP Coeff band Y",        Category.Y_AXIS, description="LP bandpass coeff Y"),
-    RegisterDef("LP Coeff band Y before", Category.Y_AXIS, description="LP bandpass coeff Y (before)"),
-    RegisterDef("HP coeff band Y before", Category.Y_AXIS, description="HP bandpass coeff Y (before)"),
-    RegisterDef("LP Coeff Y",             Category.Y_AXIS, description="Low-pass filter coeff Y"),
-    RegisterDef("LP Coeff Y before",      Category.Y_AXIS, description="Low-pass filter coeff Y (before)"),
-    RegisterDef("final filter coeff Y",   Category.Y_AXIS, description="Final output filter Y"),
-    RegisterDef("final filter coeff Y before", Category.Y_AXIS, description="Final output filter Y (before)"),
+    RegisterDef("HP Coeff band Y",        Category.Y_AXIS, n_elements=6, description="HP bandpass coeff Y"),
+    RegisterDef("LP Coeff band Y",        Category.Y_AXIS, n_elements=6, description="LP bandpass coeff Y"),
+    RegisterDef("LP Coeff band Y before", Category.Y_AXIS, n_elements=6, description="LP bandpass coeff Y (before)"),
+    RegisterDef("HP coeff band Y before", Category.Y_AXIS, n_elements=6, description="HP bandpass coeff Y (before)"),
+    RegisterDef("LP Coeff Y",             Category.Y_AXIS, n_elements=2, description="Low-pass filter coeff Y"),
+    RegisterDef("LP Coeff Y before",      Category.Y_AXIS, n_elements=2, description="Low-pass filter coeff Y (before)"),
+    RegisterDef("final filter coeff Y",   Category.Y_AXIS, n_elements=6, description="Final output filter Y"),
+    RegisterDef("final filter coeff Y before", Category.Y_AXIS, n_elements=6, description="Final output filter Y (before)"),
     RegisterDef("Lower lim Y before",     Category.Y_AXIS, is_integer=True, description="Lower limit Y (before chamber)"),
     RegisterDef("Upper lim Y before",     Category.Y_AXIS, is_integer=True, description="Upper limit Y (before chamber)"),
     RegisterDef("dgy mod",                Category.Y_AXIS, description="Derivative gain Y modulation"),
     RegisterDef("activate COMy",          Category.Y_AXIS, is_bool=True, description="Activate COM Y output"),
     RegisterDef("Reset y accum",          Category.Y_AXIS, is_bool=True, description="Reset Y accumulator"),
-    RegisterDef("Notch coeff y 1",        Category.Y_AXIS, description="Notch filter 1 coeff Y"),
-    RegisterDef("Notch coeff y 2",        Category.Y_AXIS, description="Notch filter 2 coeff Y"),
-    RegisterDef("Notch coeff y 3",        Category.Y_AXIS, description="Notch filter 3 coeff Y"),
-    RegisterDef("Notch coeff y 4",        Category.Y_AXIS, description="Notch filter 4 coeff Y"),
+    RegisterDef("Notch coeff y 1",        Category.Y_AXIS, n_elements=3, description="Notch filter 1 coeff Y"),
+    RegisterDef("Notch coeff y 2",        Category.Y_AXIS, n_elements=3, description="Notch filter 2 coeff Y"),
+    RegisterDef("Notch coeff y 3",        Category.Y_AXIS, n_elements=3, description="Notch filter 3 coeff Y"),
+    RegisterDef("Notch coeff y 4",        Category.Y_AXIS, n_elements=3, description="Notch filter 4 coeff Y"),
 
     # --- X axis ---
     RegisterDef("X Setpoint",             Category.X_AXIS, is_integer=True, description="X feedback setpoint"),
@@ -157,7 +158,7 @@ REGISTERS: list[RegisterDef] = [
     RegisterDef("pg X",                   Category.X_AXIS, description="Proportional gain X"),
     RegisterDef("Upper lim X",            Category.X_AXIS, is_integer=True, description="Upper saturation limit X"),
     RegisterDef("Lower lim X",            Category.X_AXIS, is_integer=True, description="Lower saturation limit X"),
-    RegisterDef("ig X",                   Category.X_AXIS, description="Integral gain X"),
+    RegisterDef(" ig X",                  Category.X_AXIS, description="Integral gain X"),
     RegisterDef("fb X plot",              Category.X_AXIS, Access.READ, description="Feedback output X"),
     RegisterDef("dg X",                   Category.X_AXIS, description="Derivative gain X"),
     RegisterDef("dg X before",            Category.X_AXIS, description="Derivative gain X (before chamber)"),
@@ -169,27 +170,27 @@ REGISTERS: list[RegisterDef] = [
     RegisterDef("X before Setpoint",      Category.X_AXIS, is_integer=True, description="X before-chamber setpoint"),
     RegisterDef("AI X before chamber plot", Category.X_AXIS, Access.READ, description="X sensor before chamber"),
     RegisterDef("Use X PID before",       Category.X_AXIS, is_bool=True, description="Enable before-chamber PID X"),
-    RegisterDef("HP Coeff X",             Category.X_AXIS, description="High-pass filter coeff X"),
-    RegisterDef("HP Coeff X before",      Category.X_AXIS, description="High-pass filter coeff X (before)"),
+    RegisterDef("HP Coeff X",             Category.X_AXIS, n_elements=2, description="High-pass filter coeff X"),
+    RegisterDef("HP Coeff X before",      Category.X_AXIS, n_elements=2, description="High-pass filter coeff X (before)"),
     RegisterDef("dg band X",              Category.X_AXIS, description="Derivative bandpass gain X"),
     RegisterDef("dg band X before",       Category.X_AXIS, description="Derivative bandpass gain X (before)"),
-    RegisterDef("HP Coeff band X",        Category.X_AXIS, description="HP bandpass coeff X"),
-    RegisterDef("LP Coeff band X",        Category.X_AXIS, description="LP bandpass coeff X"),
-    RegisterDef("LP Coeff band X before", Category.X_AXIS, description="LP bandpass coeff X (before)"),
-    RegisterDef("HP coeff band X before", Category.X_AXIS, description="HP bandpass coeff X (before)"),
-    RegisterDef("LP Coeff X",             Category.X_AXIS, description="Low-pass filter coeff X"),
-    RegisterDef("LP Coeff X before",      Category.X_AXIS, description="Low-pass filter coeff X (before)"),
-    RegisterDef("final filter coeff X",   Category.X_AXIS, description="Final output filter X"),
-    RegisterDef("final filter coeff X before", Category.X_AXIS, description="Final output filter X (before)"),
+    RegisterDef("HP Coeff band X",        Category.X_AXIS, n_elements=6, description="HP bandpass coeff X"),
+    RegisterDef("LP Coeff band X",        Category.X_AXIS, n_elements=6, description="LP bandpass coeff X"),
+    RegisterDef("LP Coeff band X before", Category.X_AXIS, n_elements=6, description="LP bandpass coeff X (before)"),
+    RegisterDef("HP coeff band X before", Category.X_AXIS, n_elements=6, description="HP bandpass coeff X (before)"),
+    RegisterDef("LP Coeff X",             Category.X_AXIS, n_elements=2, description="Low-pass filter coeff X"),
+    RegisterDef("LP Coeff X before",      Category.X_AXIS, n_elements=2, description="Low-pass filter coeff X (before)"),
+    RegisterDef("final filter coeff X",   Category.X_AXIS, n_elements=6, description="Final output filter X"),
+    RegisterDef("final filter coeff X before", Category.X_AXIS, n_elements=6, description="Final output filter X (before)"),
     RegisterDef("Lower lim X before",     Category.X_AXIS, is_integer=True, description="Lower limit X (before chamber)"),
     RegisterDef("Upper lim X before",     Category.X_AXIS, is_integer=True, description="Upper limit X (before chamber)"),
     RegisterDef("dgx mod",                Category.X_AXIS, description="Derivative gain X modulation"),
     RegisterDef("activate COMx",          Category.X_AXIS, is_bool=True, description="Activate COM X output"),
     RegisterDef("Reset x accum",          Category.X_AXIS, is_bool=True, description="Reset X accumulator"),
-    RegisterDef("Notch coeff x 1",        Category.X_AXIS, description="Notch filter 1 coeff X"),
-    RegisterDef("Notch coeff x 2",        Category.X_AXIS, description="Notch filter 2 coeff X"),
-    RegisterDef("Notch coeff x 3",        Category.X_AXIS, description="Notch filter 3 coeff X"),
-    RegisterDef("Notch coeff x 4",        Category.X_AXIS, description="Notch filter 4 coeff X"),
+    RegisterDef("Notch coeff x 1",        Category.X_AXIS, n_elements=3, description="Notch filter 1 coeff X"),
+    RegisterDef("Notch coeff x 2",        Category.X_AXIS, n_elements=3, description="Notch filter 2 coeff X"),
+    RegisterDef("Notch coeff x 3",        Category.X_AXIS, n_elements=3, description="Notch filter 3 coeff X"),
+    RegisterDef("Notch coeff x 4",        Category.X_AXIS, n_elements=3, description="Notch filter 4 coeff X"),
 
     # --- Arbitrary waveform ---
     RegisterDef("Arb gain (ch0)",         Category.ARB_WAVEFORM, is_integer=True, description="Arb waveform gain ch0"),
@@ -437,8 +438,58 @@ def hz_to_periods_per_tick(freq_hz: float,
     return sample_rate / freq_hz
 
 
+def _hp_array(alpha: float) -> list:
+    """2-element HP IIR coefficient array: [pole, 0.0].
+
+    Element layout assumed by the LabVIEW FPGA HP filter block:
+      [a1 = pole coefficient,  element-1 (usage TBD by LabVIEW impl)]
+    Verify against the LabVIEW VI if filter behaviour is unexpected.
+    """
+    return [alpha, 0.0]
+
+
+def _lp_array(alpha: float) -> list:
+    """2-element LP IIR coefficient array: [pole, gain].
+
+    Standard first-order LP: y[n] = alpha*y[n-1] + (1-alpha)*x[n]
+    Element layout: [a1=alpha, b0=1-alpha].
+    Verify against the LabVIEW VI if filter behaviour is unexpected.
+    """
+    return [alpha, 1.0 - alpha]
+
+
+def _band6_array(alpha: float) -> list:
+    """6-element bandpass / final-filter coefficient array.
+
+    The FPGA band filter is assumed to store the primary IIR coefficient in
+    element 0 with the remaining 5 elements zero-padded.  Verify the full
+    6-element layout against the LabVIEW VI if behaviour is unexpected.
+    """
+    return [alpha, 0.0, 0.0, 0.0, 0.0, 0.0]
+
+
+def _notch_array(freq_hz: float, q: float,
+                 sample_rate: float = FPGA_SAMPLE_RATE) -> list:
+    """3-element notch IIR coefficient array.
+
+    Standard biquad notch:
+      H(z) = (1 - 2*cos(w0)*z^-1 + z^-2) / (1 - 2*r*cos(w0)*z^-1 + r^2*z^-2)
+    where r = 1 - pi*(f0/Q)/fs  and  w0 = 2*pi*f0/fs.
+
+    Element layout: [r^2,  2*r*cos(w0),  2*cos(w0)]
+    (denominator a2, |denominator a1|, |numerator b1|).
+    Verify the exact sign conventions against the LabVIEW VI.
+    """
+    if freq_hz <= 0 or q <= 0:
+        return [0.0, 0.0, 0.0]
+    bw    = freq_hz / q
+    r     = max(0.0, 1.0 - math.pi * bw / sample_rate)
+    cos_w = math.cos(2.0 * math.pi * freq_hz / sample_rate)
+    return [r ** 2, 2.0 * r * cos_w, 2.0 * cos_w]
+
+
 def compute_coefficients(axis: str, host_params: dict[str, float],
-                         sample_rate: float = FPGA_SAMPLE_RATE) -> dict[str, float]:
+                         sample_rate: float = FPGA_SAMPLE_RATE) -> dict:
     """Compute FPGA filter-coefficient registers from host parameters.
 
     Parameters
@@ -449,52 +500,52 @@ def compute_coefficients(axis: str, host_params: dict[str, float],
 
     Returns
     -------
-    dict mapping FPGA register names to computed coefficient values
+    dict mapping FPGA register names to values.
+    Scalar registers → float.  Array registers → list[float].
     """
-    a = axis.upper()
+    a  = axis.upper()
     al = axis.lower()
-    result: dict[str, float] = {}
+    result: dict = {}
 
-    # HP / LP filter coefficients
-    result[f"HP Coeff {a}"] = freq_to_hp_coeff(
-        host_params.get(f"hp freq {a}", 0), sample_rate)
-    result[f"LP Coeff {a}"] = freq_to_lp_coeff(
-        host_params.get(f"lp freq {a}", 0), sample_rate)
-    result[f"HP Coeff {a} before"] = freq_to_hp_coeff(
-        host_params.get(f"hp freq {a} before", 0), sample_rate)
-    result[f"LP Coeff {a} before"] = freq_to_lp_coeff(
-        host_params.get(f"lp freq {a} before", 0), sample_rate)
+    # HP / LP filter coefficients (2-element array registers)
+    result[f"HP Coeff {a}"] = _hp_array(
+        freq_to_hp_coeff(host_params.get(f"hp freq {a}", 0), sample_rate))
+    result[f"LP Coeff {a}"] = _lp_array(
+        freq_to_lp_coeff(host_params.get(f"lp freq {a}", 0), sample_rate))
+    result[f"HP Coeff {a} before"] = _hp_array(
+        freq_to_hp_coeff(host_params.get(f"hp freq {a} before", 0), sample_rate))
+    result[f"LP Coeff {a} before"] = _lp_array(
+        freq_to_lp_coeff(host_params.get(f"lp freq {a} before", 0), sample_rate))
 
-    # Band-pass filter coefficients
-    result[f"HP Coeff band {a}"] = freq_to_hp_coeff(
-        host_params.get(f"hp freq band{a}", 0), sample_rate)
-    result[f"LP Coeff band {a}"] = freq_to_lp_coeff(
-        host_params.get(f"lp freq band{a}", 0), sample_rate)
+    # Band-pass filter coefficients (6-element array registers)
+    result[f"HP Coeff band {a}"] = _band6_array(
+        freq_to_hp_coeff(host_params.get(f"hp freq band{a}", 0), sample_rate))
+    result[f"LP Coeff band {a}"] = _band6_array(
+        freq_to_lp_coeff(host_params.get(f"lp freq band{a}", 0), sample_rate))
 
-    # Band before-chamber (host-param name differs between X/Y and Z)
     hp_band_before = host_params.get(
         f"hp freq {a} band before",
         host_params.get(f"hp freq band {a} before", 0))
-    result[f"HP coeff band {a} before"] = freq_to_hp_coeff(
-        hp_band_before, sample_rate)
+    result[f"HP coeff band {a} before"] = _band6_array(
+        freq_to_hp_coeff(hp_band_before, sample_rate))
 
     lp_band_before = host_params.get(
         f"lp freq {a} band before",
         host_params.get(f"lp freq band {a} before", 0))
-    result[f"LP Coeff band {a} before"] = freq_to_lp_coeff(
-        lp_band_before, sample_rate)
+    result[f"LP Coeff band {a} before"] = _band6_array(
+        freq_to_lp_coeff(lp_band_before, sample_rate))
 
-    # Final LP filter
-    result[f"final filter coeff {a}"] = freq_to_lp_coeff(
-        host_params.get(f"LP FF {a}", 0), sample_rate)
+    # Final LP filter (6-element array register)
+    result[f"final filter coeff {a}"] = _band6_array(
+        freq_to_lp_coeff(host_params.get(f"LP FF {a}", 0), sample_rate))
     if a == "Z":
-        result["final filter coeff Z before"] = freq_to_lp_coeff(
-            host_params.get("LP FF Z before", 0), sample_rate)
+        result["final filter coeff Z before"] = _band6_array(
+            freq_to_lp_coeff(host_params.get("LP FF Z before", 0), sample_rate))
 
-    # Notch filters (4 per axis)
+    # Notch filters — 4 per axis (3-element array registers)
     for i in range(1, 5):
-        f = host_params.get(f"notch freq {i} {al}", 0)
-        q = host_params.get(f"notch Q {i} {al}", 1)
-        result[f"Notch coeff {al} {i}"] = freq_q_to_notch_coeff(f, q, sample_rate)
+        f0 = host_params.get(f"notch freq {i} {al}", 0)
+        q  = host_params.get(f"notch Q {i} {al}", 1)
+        result[f"Notch coeff {al} {i}"] = _notch_array(f0, q, sample_rate)
 
     return result

@@ -5,6 +5,10 @@ resources/*
 !resources/usphere-daq
 !resources/EDWARDS-TIC
 !resources/Microsphere-Utility-Scripts
+!resources/TENMA_72-XXXX
+!resources/kcube-motor-controller
+!resources/Solenoid-valve-controller
+!resources/IdealVac-CommandValve
 
 # Python
 __pycache__/
@@ -40,3 +44,16 @@ Thumbs.db
 
 # Logs
 *.log
+
+# Runtime session / IPC state (auto-generated, not source)
+session_state.json
+fpga_session_log.jsonl
+fpga_snapshot_*.json
+ipc/*.json
+ipc/*.jsonl
+
+# Waveform data files
+waveforms/
+
+# Backup / scratch copies in docs
+docs/*.py

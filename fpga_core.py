@@ -464,33 +464,52 @@ class FPGAController:
         self._on_status(msg)
 
     def _read_one(self, name: str) -> float:
-        """Read one register (caller holds _lock)."""
+        """Read one register (caller holds _lock).
+
+        For array registers nifpga returns a list; we return the first element
+        so the existing scalar GUI display path keeps working.
+        """
         if self._session is not None:
             try:
                 val = self._session.registers[name].read()
+                if isinstance(val, (list, tuple)):
+                    return float(val[0]) if val else 0.0
                 return 1.0 if val is True else (0.0 if val is False else float(val))
             except Exception:
                 return 0.0
         else:
-            return self._sim_regs.get(name, 0.0)
+            sim = self._sim_regs.get(name, 0.0)
+            return float(sim[0]) if isinstance(sim, list) else sim
 
-    def _write_one(self, name: str, value: float, reg: RegisterDef) -> None:
-        """Write one register (caller holds _lock)."""
+    def _write_one(self, name: str, value, reg: RegisterDef) -> None:
+        """Write one register (caller holds _lock).
+
+        *value* may be a list for array registers (n_elements > 1).
+        If a scalar is passed for an array register the value is placed in
+        element 0 and the remaining elements are set to 0.0.
+        """
         if self._session is not None:
             nifpga_reg = self._session.registers[name]
             if reg.is_bool:
                 nifpga_reg.write(bool(value))
+            elif reg.n_elements > 1:
+                # Array FXP register — nifpga requires a list of the exact length
+                if isinstance(value, (list, tuple)):
+                    arr = list(value)
+                else:
+                    arr = [float(value)] + [0.0] * (reg.n_elements - 1)
+                nifpga_reg.write(arr)
             elif reg.is_integer:
-                nifpga_reg.write(int(round(value)))
+                nifpga_reg.write(int(round(float(value))))
             else:
                 # FXP / SGL / DBL registers expect float.  If the LabVIEW VI
                 # uses an integer type that isn't yet flagged with is_integer,
                 # ctypes raises TypeError — catch it and retry as int so the
                 # write succeeds; mark the register is_integer to fix it properly.
                 try:
-                    nifpga_reg.write(value)
+                    nifpga_reg.write(float(value))
                 except TypeError:
-                    nifpga_reg.write(int(round(value)))
+                    nifpga_reg.write(int(round(float(value))))
                     self._log(
                         f"[type warning] {name!r} rejected float — "
                         "wrote as int. Set is_integer=True in fpga_registers.py.")
@@ -498,21 +517,20 @@ class FPGAController:
             self._sim_regs[name] = value
 
     def _monitor_loop(self) -> None:
-        plot_dt = self.config.plot_interval_ms / 1000.0
-        full_dt = self.config.poll_interval_ms / 1000.0
-        full_every = max(1, round(full_dt / plot_dt)) if plot_dt > 0 else 1
-        counter = 0
+        import time as _time
+        _last_full = 0.0
 
         while not self._monitor_stop.is_set():
+            plot_dt = max(0.001, self.config.plot_interval_ms / 1000.0)
+            full_dt = max(0.001, self.config.poll_interval_ms / 1000.0)
+
             if self._connected:
-                # Fast: read only plot indicators
                 if self._on_plot_data and self._plot_names:
                     self._on_plot_data(self.read_registers(self._plot_names))
 
-                # Slow: periodically read all registers for GUI fields
-                counter += 1
-                if counter >= full_every:
-                    counter = 0
+                now = _time.monotonic()
+                if now - _last_full >= full_dt:
+                    _last_full = now
                     if self._on_registers_updated:
                         self._on_registers_updated(self.read_all())
 
