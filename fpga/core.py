@@ -408,31 +408,43 @@ class FPGAController:
             return
 
         # --- Register write path ---
-        # Bitfile analysis: ready_to_write is a HOST-written control (Indicator=false).
-        # The FPGA continuously latches memory[write_address] ← data_buffer while
-        # ready_to_write=True, so holding it high for the whole loop creates a race:
-        # the FPGA sees the new address before the new data arrives, writing the
-        # previous sample's data to the new address.  This produces a waveform with
-        # the correct envelope but corrupted per-sample values.
+        # Bitfile analysis: ready_to_write is HOST-written (Indicator=false).
+        # The FPGA latches memory[write_address] ← data_buffer while ready_to_write=True.
+        # Holding it True for the whole loop causes a race: the FPGA sees the new address
+        # before the new data arrives, writing the previous sample's data to the new
+        # address → correct envelope but corrupted per-sample values.
         #
-        # Fix: write data FIRST (so it is stable), then address, then pulse
-        # ready_to_write True→False per sample so the FPGA only latches when
-        # both address and data are settled.
-        #
-        # Data buffers are I16 — clip to ±32767 before writing.
+        # Fix: write data first (stable), then address, then pulse ready_to_write
+        # True→False per sample.  Use direct nifpga register objects to skip the
+        # per-call dictionary lookup and type-dispatch overhead of _write_one.
         buf_names = ["data_buffer_1", "data_buffer2", "data_buffer3"]
         int_data = np.clip(np.round(data[:, :n_ch]), -32768, 32767).astype(int)
-        addr_reg  = REGISTER_MAP["write_address"]
-        rtw_reg   = REGISTER_MAP["ready_to_write"]
-        buf_regs  = [REGISTER_MAP[buf_names[c]] for c in range(n_ch)]
-        with self._lock:
-            self._write_one("ready_to_write", False, rtw_reg)  # ensure clean start
-            for i in range(n_samples):
-                for c in range(n_ch):
-                    self._write_one(buf_names[c], int(int_data[i, c]), buf_regs[c])
-                self._write_one("write_address", i, addr_reg)
-                self._write_one("ready_to_write", True, rtw_reg)
+        if self._session is not None:
+            # Fast path: direct nifpga register writes (no _write_one overhead)
+            nifpga_bufs = [self._session.registers[n] for n in buf_names[:n_ch]]
+            nifpga_addr = self._session.registers["write_address"]
+            nifpga_rtw  = self._session.registers["ready_to_write"]
+            with self._lock:
+                nifpga_rtw.write(False)
+                for i in range(n_samples):
+                    for c in range(n_ch):
+                        nifpga_bufs[c].write(int(int_data[i, c]))
+                    nifpga_addr.write(i)
+                    nifpga_rtw.write(True)
+                    nifpga_rtw.write(False)
+        else:
+            # Simulation path
+            addr_reg = REGISTER_MAP["write_address"]
+            rtw_reg  = REGISTER_MAP["ready_to_write"]
+            buf_regs = [REGISTER_MAP[buf_names[c]] for c in range(n_ch)]
+            with self._lock:
                 self._write_one("ready_to_write", False, rtw_reg)
+                for i in range(n_samples):
+                    for c in range(n_ch):
+                        self._write_one(buf_names[c], int(int_data[i, c]), buf_regs[c])
+                    self._write_one("write_address", i, addr_reg)
+                    self._write_one("ready_to_write", True, rtw_reg)
+                    self._write_one("ready_to_write", False, rtw_reg)
         self._log(f"Arb write complete: {n_samples} samples")
         _append_log("arb_write", {"samples": n_samples, "channels": n_ch})
 
