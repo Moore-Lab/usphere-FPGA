@@ -2528,14 +2528,30 @@ class FPGAWidget(QWidget):
         if not loaded:
             self._append_status("No waveform loaded. Use 'Load & Preview' first.")
             return
+        if getattr(self, "_arb_write_thread", None) and self._arb_write_thread.is_alive():
+            self._append_status("Arb write already in progress.")
+            return
         n = len(loaded[0][1])
         cols = [d[:n] for _, d in loaded]
         data = np.column_stack(cols) if len(cols) > 1 else cols[0].reshape(-1, 1)
-        try:
-            self._ctrl.write_arb_data(data)
-            self._append_status(f"Arb written: {n} pts × {len(cols)} col(s)")
-        except Exception as exc:
-            self._append_status(f"Arb load failed: {exc}")
+
+        self._player_write_btn.setEnabled(False)
+        self._player_write_btn.setText("Writing…")
+
+        def _run():
+            try:
+                self._ctrl.write_arb_data(data)
+            except Exception as exc:
+                self._signals.status_message.emit(f"Arb load failed: {exc}")
+            finally:
+                QTimer.singleShot(0, self._arb_write_done)
+
+        self._arb_write_thread = threading.Thread(target=_run, daemon=True)
+        self._arb_write_thread.start()
+
+    def _arb_write_done(self) -> None:
+        self._player_write_btn.setEnabled(True)
+        self._player_write_btn.setText("Write to FPGA")
 
     # ==================================================================
     # Sphere save / load
