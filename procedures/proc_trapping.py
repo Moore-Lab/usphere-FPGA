@@ -1276,8 +1276,10 @@ class TrappingPanel(QWidget):
 # ---------------------------------------------------------------------------
 
 class Procedure(ControlProcedure):
-    NAME       = "Trapping"
-    PERSISTENT = True
+    NAME            = "Trapping"
+    PERSISTENT      = True
+    WANTS_FAST_DATA = True
+    REQUIRES        = ["Dropper Stage", "Shake Dropper"]
     DESCRIPTION = (
         "Sphere trapping workflow: dropper stage shortcuts, shake-dropper "
         "shortcuts with auto-catch, X/Y/Z RMS catching / trapping / lock thresholds, "
@@ -1305,6 +1307,10 @@ class Procedure(ControlProcedure):
     def on_fpga_update(self, state: dict) -> None:
         if self._widget is not None:
             self._widget.update_preset_readbacks(state)
+
+    def on_fast_data(self, values: dict) -> None:
+        if self._widget is not None:
+            self._widget.on_fast_data(values)
 
     def get_ui_state(self) -> dict:
         if self._widget is not None:

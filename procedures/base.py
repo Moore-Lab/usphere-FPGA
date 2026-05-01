@@ -144,6 +144,16 @@ class ControlProcedure:
     NAME: str = "Unnamed Procedure"
     DESCRIPTION: str = ""
 
+    PERSISTENT: bool = False
+    """If True, the Resources panel auto-loads this on startup."""
+
+    REQUIRES: list = []
+    """Names of other procedures that must be connected first.
+    The Resources panel passes their widgets to set_instruments() in order."""
+
+    WANTS_FAST_DATA: bool = False
+    """If True, notify_fast_data() will call on_fast_data() each plot cycle."""
+
     fpga: FPGAFacade | None = None
     """Injected by the procedure manager after loading."""
 
@@ -154,13 +164,23 @@ class ControlProcedure:
     def on_fpga_update(self, state: dict[str, float]) -> None:
         """Called each monitor cycle with the current FPGA register snapshot.
 
-        *state* is the same dict returned by FPGAFacade.read_all().
-        Override to react to live hardware state (trap signal crossing a
-        threshold, pressure reaching a target, etc.).
-
         This is called from the monitor thread — never update Qt widgets
         directly here.  Emit a Qt signal instead.
         """
+
+    def on_fast_data(self, values: dict[str, float]) -> None:
+        """Called each plot cycle with fast-data values (e.g. AI X/Y/Z plot).
+
+        Only called when WANTS_FAST_DATA = True.  Like on_fpga_update, this
+        runs on the monitor thread — route UI updates through Qt signals.
+        """
+
+    def get_ui_state(self) -> dict:
+        """Return widget values for session persistence."""
+        return {}
+
+    def restore_ui_state(self, state: dict) -> None:
+        """Restore widget values from a session-state dict."""
 
     def teardown(self) -> None:
         """Called when the procedure tab is closed or the app shuts down.

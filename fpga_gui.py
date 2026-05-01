@@ -254,144 +254,304 @@ class _ModulesWidget(QWidget):
 
 
 # ---------------------------------------------------------------------------
-# Procedures tab
+# Resources panel — unified plugin lifecycle manager
 # ---------------------------------------------------------------------------
 
-class _ProcedureManagerWidget(QWidget):
+class _ResourcesWidget(QWidget):
     """
-    Manages loading and unloading of control procedures (procedures/proc_*.py).
+    Unified Resources panel.  Discovers all ControlProcedure plugins
+    (proc_*.py) and lets the user connect / disconnect each one.
 
-    Each available procedure is listed with a Load / Unload button.  Loading
-    instantiates the procedure, injects a LiveFPGAFacade, calls create_widget(),
-    and adds the resulting widget as a new top-level tab.  Unloading removes
-    the tab and calls teardown().
+    PERSISTENT procedures are auto-loaded on startup via auto_load_persistent().
+    Procedures that declare REQUIRES = [name, ...] only become connectable once
+    their named dependencies are already connected.
 
-    Call notify_fpga_update(state) each monitor cycle to forward the FPGA
-    register snapshot to all loaded procedures' on_fpga_update() hooks.
+    Public surface used by FPGAWidget
+    ----------------------------------
+    auto_load_persistent()         — call once in _build_ui after creation
+    notify_fpga_update(state)      — forward slow-poll snapshot to loaded procs
+    notify_fast_data(values)       — forward fast-plot data (WANTS_FAST_DATA=True)
+    get_ui_states()                — {loaded:[...], state:{name:dict}} for persistence
+    restore_ui_states(data)        — reverse; accepts both new and legacy formats
+    teardown_all()                 — teardown all loaded procs on app close
     """
+
+    _LED_OFF = ("background-color: #d1d5db; border-radius: 7px; "
+                "border: 1px solid #9ca3af;")
+    _LED_ON  = ("background-color: #22c55e; border-radius: 7px; "
+                "border: 1px solid #16a34a;")
 
     def __init__(self, tabs: QTabWidget, fpga_controller: FPGAController,
                  parent=None):
         super().__init__(parent)
-        self._tabs = tabs
-        self._ctrl = fpga_controller
-        self._loaded: dict[str, tuple[object, QWidget]] = {}
-        self._buttons: dict[str, QPushButton] = {}
+        self._tabs   = tabs
+        self._ctrl   = fpga_controller
+        self._facade = LiveFPGAFacade(self._ctrl)
+
+        self._loaded:    dict[str, tuple] = {}          # name → (proc, widget)
+        self._buttons:   dict[str, QPushButton] = {}
+        self._leds:      dict[str, QLabel] = {}
+        self._dep_lbls:  dict[str, QLabel] = {}
         self._available: list = []
 
         try:
-            from procedures import discover_procedures
-            self._available = discover_procedures()
+            from procedures import discover_all_procedures
+            self._available = discover_all_procedures()
         except Exception as exc:
-            print(f"[procedures] Discovery failed: {exc}")
+            print(f"[resources] Discovery failed: {exc}")
 
         self._build_ui()
 
+    # ------------------------------------------------------------------
+    # UI
+    # ------------------------------------------------------------------
+
     def _build_ui(self) -> None:
-        layout = QVBoxLayout(self)
-        layout.setContentsMargins(8, 8, 8, 8)
+        outer = QVBoxLayout(self)
+        outer.setContentsMargins(0, 0, 0, 0)
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        container = QWidget()
+        layout = QVBoxLayout(container)
         layout.setSpacing(8)
+        layout.setContentsMargins(8, 8, 8, 8)
 
         header = QLabel(
-            "<b>Control Procedures</b><br>"
-            "<span style='color:gray; font-size:10px;'>"
-            "Load a procedure to add its control tab to the GUI.  "
-            "The FPGA must be connected before running any procedure.</span>"
+            "<b>Resources</b><br>"
+            "<span style='color:#6b7280; font-size:10px;'>"
+            "Connect a resource to open its control tab.  "
+            "Resources with dependencies must have those connected first.</span>"
         )
         header.setWordWrap(True)
         layout.addWidget(header)
 
         if not self._available:
-            layout.addWidget(QLabel(
-                "No procedures found in procedures/  "
-                "(files must be named proc_*.py and expose a Procedure class)."))
-            layout.addStretch()
-            return
-
-        for cls in self._available:
-            grp = QGroupBox(cls.NAME)
-            gl = QVBoxLayout(grp)
-
-            if cls.DESCRIPTION:
-                desc = QLabel(cls.DESCRIPTION)
-                desc.setWordWrap(True)
-                desc.setStyleSheet("color: gray; font-size: 10px;")
-                gl.addWidget(desc)
-
-            btn_row = QHBoxLayout()
-            btn = QPushButton("Load")
-            btn.setFixedWidth(90)
-            btn.setStyleSheet(
-                "QPushButton { background-color: #2563eb; color: white; "
-                "font-weight: bold; padding: 3px 8px; border-radius: 3px; }"
-                "QPushButton:hover { background-color: #3b82f6; }"
-            )
-            btn.clicked.connect(lambda _, c=cls: self._toggle(c))
-            self._buttons[cls.NAME] = btn
-            btn_row.addWidget(btn)
-            btn_row.addStretch()
-            gl.addLayout(btn_row)
-            layout.addWidget(grp)
+            layout.addWidget(QLabel("No proc_*.py files found in procedures/"))
+        else:
+            for cls in self._available:
+                layout.addWidget(self._make_row(cls))
 
         layout.addStretch()
+        scroll.setWidget(container)
+        outer.addWidget(scroll)
+
+    def _make_row(self, cls) -> QGroupBox:
+        grp = QGroupBox()
+        gl = QVBoxLayout(grp)
+        gl.setContentsMargins(8, 6, 8, 6)
+        gl.setSpacing(3)
+
+        hr = QHBoxLayout()
+        led = QLabel()
+        led.setFixedSize(14, 14)
+        led.setStyleSheet(self._LED_OFF)
+        self._leds[cls.NAME] = led
+        hr.addWidget(led)
+
+        hr.addWidget(QLabel(f"<b>{cls.NAME}</b>"), stretch=1)
+
+        btn = QPushButton("Connect")
+        btn.setFixedWidth(100)
+        btn.setFixedHeight(28)
+        self._style_connect(btn)
+        btn.clicked.connect(lambda _, c=cls: self._toggle(c))
+        self._buttons[cls.NAME] = btn
+        hr.addWidget(btn)
+        gl.addLayout(hr)
+
+        desc = getattr(cls, "DESCRIPTION", "")
+        if desc:
+            dl = QLabel(desc)
+            dl.setWordWrap(True)
+            dl.setStyleSheet("color: #6b7280; font-size: 10px; margin-left: 20px;")
+            gl.addWidget(dl)
+
+        requires = getattr(cls, "REQUIRES", [])
+        if requires:
+            dep_lbl = QLabel(f"Requires: {', '.join(requires)}")
+            dep_lbl.setStyleSheet(
+                "color: #9ca3af; font-size: 10px; margin-left: 20px;")
+            self._dep_lbls[cls.NAME] = dep_lbl
+            gl.addWidget(dep_lbl)
+
+        return grp
+
+    @staticmethod
+    def _style_connect(btn: QPushButton) -> None:
+        btn.setStyleSheet(
+            "QPushButton { background-color: #2563eb; color: white; "
+            "font-weight: bold; font-size: 11px; border-radius: 3px; }"
+            "QPushButton:hover { background-color: #3b82f6; }"
+            "QPushButton:disabled { background-color: #d1d5db; color: #9ca3af; }"
+        )
+
+    @staticmethod
+    def _style_disconnect(btn: QPushButton) -> None:
+        btn.setStyleSheet(
+            "QPushButton { background-color: #dc2626; color: white; "
+            "font-weight: bold; font-size: 11px; border-radius: 3px; }"
+            "QPushButton:hover { background-color: #ef4444; }"
+        )
+
+    # ------------------------------------------------------------------
+    # Connect / Disconnect
+    # ------------------------------------------------------------------
 
     def _toggle(self, cls) -> None:
         if cls.NAME in self._loaded:
-            self._unload(cls.NAME)
+            self._disconnect(cls.NAME)
         else:
-            self._load(cls)
+            self._connect(cls)
 
-    def _load(self, cls) -> None:
+    def _connect(self, cls) -> None:
+        requires = getattr(cls, "REQUIRES", [])
+        if any(r not in self._loaded for r in requires):
+            return
+
         proc = cls()
-        proc.fpga = LiveFPGAFacade(self._ctrl)
+        proc.fpga = self._facade
+
+        # Wire dependencies before create_widget so the widget has them on init
+        if requires and hasattr(proc, "set_instruments"):
+            dep_widgets = [self._loaded[dep][1] for dep in requires]
+            proc.set_instruments(*dep_widgets)
+
         try:
             widget = proc.create_widget()
         except Exception as exc:
-            print(f"[procedures] {cls.NAME} create_widget failed: {exc}")
+            print(f"[resources] {cls.NAME} create_widget failed: {exc}")
             return
-        self._tabs.addTab(widget, proc.NAME)
-        self._loaded[proc.NAME] = (proc, widget)
-        self._tabs.setCurrentWidget(widget)
-        btn = self._buttons.get(proc.NAME)
-        if btn:
-            btn.setText("Unload")
-            btn.setStyleSheet(
-                "QPushButton { background-color: #c0392b; color: white; "
-                "font-weight: bold; padding: 3px 8px; border-radius: 3px; }"
-                "QPushButton:hover { background-color: #e74c3c; }"
-            )
 
-    def _unload(self, name: str) -> None:
+        self._tabs.addTab(widget, cls.NAME)
+        self._loaded[cls.NAME] = (proc, widget)
+        self._tabs.setCurrentWidget(widget)
+
+        self._leds[cls.NAME].setStyleSheet(self._LED_ON)
+        btn = self._buttons[cls.NAME]
+        btn.setText("Disconnect")
+        self._style_disconnect(btn)
+
+        self._refresh_buttons()
+
+    def _disconnect(self, name: str) -> None:
+        # Block if a loaded proc depends on this one
+        for cls in self._available:
+            if cls.NAME != name and cls.NAME in self._loaded:
+                if name in getattr(cls, "REQUIRES", []):
+                    return
+
         proc, widget = self._loaded.pop(name)
         idx = self._tabs.indexOf(widget)
         if idx >= 0:
             self._tabs.removeTab(idx)
+            widget.deleteLater()
         try:
             proc.teardown()
         except Exception as exc:
-            print(f"[procedures] {name} teardown error: {exc}")
-        widget.deleteLater()
-        btn = self._buttons.get(name)
-        if btn:
-            btn.setText("Load")
-            btn.setStyleSheet(
-                "QPushButton { background-color: #2563eb; color: white; "
-                "font-weight: bold; padding: 3px 8px; border-radius: 3px; }"
-                "QPushButton:hover { background-color: #3b82f6; }"
-            )
+            print(f"[resources] {name} teardown error: {exc}")
+
+        self._leds[name].setStyleSheet(self._LED_OFF)
+        btn = self._buttons[name]
+        btn.setText("Connect")
+        self._style_connect(btn)
+
+        self._refresh_buttons()
+
+    def _refresh_buttons(self) -> None:
+        """Enable/disable Connect buttons; update dependency status labels."""
+        for cls in self._available:
+            btn = self._buttons.get(cls.NAME)
+            if btn is None:
+                continue
+            if cls.NAME in self._loaded:
+                # Can disconnect unless something loaded depends on it
+                blocked = any(
+                    cls.NAME in getattr(c, "REQUIRES", [])
+                    for c in self._available
+                    if c.NAME in self._loaded and c.NAME != cls.NAME
+                )
+                btn.setEnabled(not blocked)
+                continue
+            requires = getattr(cls, "REQUIRES", [])
+            btn.setEnabled(all(r in self._loaded for r in requires))
+            dep_lbl = self._dep_lbls.get(cls.NAME)
+            if dep_lbl and requires:
+                parts = []
+                for r in requires:
+                    if r in self._loaded:
+                        parts.append(
+                            f"<span style='color:#16a34a;'>{r} ✓</span>")
+                    else:
+                        parts.append(
+                            f"<span style='color:#dc2626;'>{r} ✗</span>")
+                dep_lbl.setText(f"Requires: {', '.join(parts)}")
+
+    # ------------------------------------------------------------------
+    # Auto-load
+    # ------------------------------------------------------------------
+
+    def auto_load_persistent(self, saved_names: list | None = None) -> None:
+        """Load PERSISTENT procedures on startup (or a specific saved list)."""
+        targets = saved_names or [
+            cls.NAME for cls in self._available
+            if getattr(cls, "PERSISTENT", False)
+        ]
+        for cls in self._available:
+            if cls.NAME in targets:
+                self._connect(cls)
+
+    # ------------------------------------------------------------------
+    # Data forwarding
+    # ------------------------------------------------------------------
 
     def notify_fpga_update(self, state: dict) -> None:
-        """Forward the FPGA register snapshot to all loaded procedures."""
-        for name, (proc, _widget) in self._loaded.items():
+        for name, (proc, _) in self._loaded.items():
             try:
                 proc.on_fpga_update(state)
             except Exception as exc:
-                print(f"[procedures] {name} on_fpga_update error: {exc}")
+                print(f"[resources] {name} on_fpga_update error: {exc}")
+
+    def notify_fast_data(self, values: dict) -> None:
+        for name, (proc, _) in self._loaded.items():
+            if getattr(type(proc), "WANTS_FAST_DATA", False):
+                try:
+                    proc.on_fast_data(values)
+                except Exception as exc:
+                    print(f"[resources] {name} on_fast_data error: {exc}")
+
+    # ------------------------------------------------------------------
+    # Session state
+    # ------------------------------------------------------------------
+
+    def get_ui_states(self) -> dict:
+        return {
+            "loaded": list(self._loaded.keys()),
+            "state":  {n: p.get_ui_state() for n, (p, _) in self._loaded.items()},
+        }
+
+    def restore_ui_states(self, data: dict) -> None:
+        """Accepts both new format {loaded:[...], state:{name:dict}}
+        and the legacy flat format {name: dict}."""
+        states = data.get("state", data)   # legacy: data IS the states dict
+        for name, (proc, _) in self._loaded.items():
+            s = states.get(name)
+            if s:
+                try:
+                    proc.restore_ui_state(s)
+                except Exception as exc:
+                    print(f"[resources] {name} restore_ui_state error: {exc}")
+
+    # ------------------------------------------------------------------
+    # Cleanup
+    # ------------------------------------------------------------------
 
     def teardown_all(self) -> None:
-        """Teardown all loaded procedures (call on app close)."""
         for name in list(self._loaded.keys()):
-            self._unload(name)
+            proc, widget = self._loaded.pop(name)
+            try:
+                proc.teardown()
+            except Exception:
+                pass
 
 
 # ---------------------------------------------------------------------------
@@ -531,9 +691,6 @@ class FPGAWidget(QWidget):
         self._wd_mc_stop_flag: list[bool] = [False]
         self._wd_has_plot: bool = False  # set in _build_waveform_designer
 
-        # Trapping procedure widget ref (set in _build_ui, used in _on_plot_data)
-        self._trap_proc_widget = None
-
         # Session state
         self._session_state: dict = {}         # loaded by _restore_full_state
         self._last_register_values: dict = {}  # updated by _on_registers_updated
@@ -559,29 +716,6 @@ class FPGAWidget(QWidget):
         tabs.addTab(self._build_connection_tab(), "Connection")
         tabs.addTab(self._build_feedback_tab(), "Feedback")
         tabs.addTab(self._build_waveform_tab(), "Waveform")
-
-        # Persistent procedure tabs — always visible, no load/unload needed
-        from procedures import proc_position_dropper, proc_shake_dropper, proc_trapping
-        _facade = LiveFPGAFacade(self._ctrl)
-
-        self._dropper_proc = proc_position_dropper.Procedure()
-        self._dropper_proc.fpga = _facade
-        _dropper_widget = self._dropper_proc.create_widget()
-
-        self._shaker_proc = proc_shake_dropper.Procedure()
-        self._shaker_proc.fpga = _facade
-        _shaker_widget = self._shaker_proc.create_widget()
-
-        self._trap_proc = proc_trapping.Procedure()
-        self._trap_proc.fpga = _facade
-        self._trap_proc.set_instruments(_dropper_widget, _shaker_widget)
-        _trap_widget = self._trap_proc.create_widget()
-        self._trap_proc_widget = self._trap_proc._widget
-
-        tabs.addTab(_trap_widget,    "Trapping")
-        tabs.addTab(_dropper_widget, "Dropper Stage")
-        tabs.addTab(_shaker_widget,  "Shake Dropper")
-
         tabs.addTab(self._build_outputs_tab(), "Outputs")
         tabs.addTab(self._build_registers_tab(), "All Registers")
         tabs.addTab(self._build_plot_tab(), "Monitor")
@@ -591,9 +725,11 @@ class FPGAWidget(QWidget):
         self._modules_widget = _ModulesWidget()
         tabs.addTab(self._modules_widget, "Modules")
 
-        # Dynamic procedure loader (for any other procedures in procedures/)
-        self._proc_manager = _ProcedureManagerWidget(tabs, self._ctrl)
-        tabs.addTab(self._proc_manager, "Procedures")
+        # Unified resource manager — discovers + loads all proc_*.py plugins
+        self._resources = _ResourcesWidget(tabs, self._ctrl)
+        tabs.addTab(self._resources, "Resources")
+        # Auto-load PERSISTENT procedures (tabs appear after Resources tab)
+        self._resources.auto_load_persistent()
 
     # ------------------------------------------------------------------
     # Connection tab
@@ -1676,12 +1812,13 @@ class FPGAWidget(QWidget):
                 edit = self._host_edits.get(name)
                 if edit is not None:
                     edit.setText(_fmt(float(val)))
-            if "dropper" in state:
-                self._dropper_proc.restore_ui_state(state["dropper"])
-            if "shaker" in state:
-                self._shaker_proc.restore_ui_state(state["shaker"])
-            if "trapping" in state:
-                self._trap_proc.restore_ui_state(state["trapping"])
+            # Resources: support both new format and legacy {dropper/shaker/trapping} keys
+            resources_data = state.get("resources", {
+                "Dropper Stage": state.get("dropper", {}),
+                "Shake Dropper": state.get("shaker", {}),
+                "Trapping":      state.get("trapping", {}),
+            })
+            self._resources.restore_ui_states(resources_data)
         except Exception as exc:
             self._append_status(f"Session restore warning: {exc}")
 
@@ -1704,9 +1841,7 @@ class FPGAWidget(QWidget):
         state["host_params"] = {k: float(v) for k, v in self._host_values.items()}
         if self._last_register_values:
             state["registers"] = dict(self._last_register_values)
-        state["dropper"]  = self._dropper_proc.get_ui_state()
-        state["shaker"]   = self._shaker_proc.get_ui_state()
-        state["trapping"] = self._trap_proc.get_ui_state()
+        state["resources"] = self._resources.get_ui_states()
         return state
 
     def _autosave_state(self) -> None:
@@ -1815,17 +1950,11 @@ class FPGAWidget(QWidget):
     def _on_registers_updated(self, values: dict) -> None:
         self._last_register_values = values
         self._update_reg_edits(values)
-        self._proc_manager.notify_fpga_update(values)
-        # Notify persistent procedures (BPD signal display in dropper/shaker tabs)
-        self._dropper_proc.on_fpga_update(values)
-        self._shaker_proc.on_fpga_update(values)
-        self._trap_proc.on_fpga_update(values)
+        self._resources.notify_fpga_update(values)
 
     def _on_plot_data(self, values: dict) -> None:
         self._plot_widget.push_values(values)
-        # Forward fast data to the trapping panel for sliding-window RMS
-        if self._trap_proc_widget is not None:
-            self._trap_proc_widget.on_fast_data(values)
+        self._resources.notify_fast_data(values)
 
     def _update_reg_edits(self, values: dict[str, float],
                           initial: bool = False) -> None:
@@ -3442,10 +3571,7 @@ class FPGAWidget(QWidget):
                 self._sv_ctrl.disconnect()
             except Exception:
                 pass
-        self._proc_manager.teardown_all()
-        self._dropper_proc.teardown()
-        self._shaker_proc.teardown()
-        self._trap_proc.teardown()
+        self._resources.teardown_all()
         self._ctrl.disconnect()
         super().closeEvent(event)
 
