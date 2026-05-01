@@ -184,6 +184,7 @@ class FPGAController:
             )
             self._connected = True
             self._log(f"[{ts}] Connected to {cfg.resource}")
+            self._log_fifos()
 
         _append_log("connect", cfg.to_dict())
 
@@ -373,27 +374,86 @@ class FPGAController:
     # Arb waveform buffer loading
     # ------------------------------------------------------------------
 
+    def _log_fifos(self) -> None:
+        """Log available FIFOs from the bitfile (called on connect)."""
+        if self._session is None:
+            return
+        fifos = getattr(self._session, "fifos", {})
+        if not fifos:
+            self._log("[arb] No FIFOs found in bitfile")
+            return
+        for name, fifo in fifos.items():
+            dtype = getattr(fifo, "datatype", "?")
+            self._log(f"[arb] FIFO: {name!r}  dtype={dtype}")
+
     def write_arb_data(self, data) -> None:
         """Write a pre-loaded numpy array to the FPGA arb buffers.
 
         data : 1-D or 2-D array; up to 3 columns map to data_buffer_1/2/3.
+
+        Fast path: if the bitfile exposes H2T FIFOs, a single DMA call is
+        used per channel (milliseconds for any buffer size).  Fallback: the
+        register-handshake path writes all samples inside a single lock
+        acquisition without per-sample polling or file I/O.
         """
         import numpy as np
         data = np.asarray(data, dtype=float)
         if data.ndim == 1:
             data = data.reshape(-1, 1)
         n_samples, n_cols = data.shape
+        n_ch = min(n_cols, 3)
+        self._log(f"Writing arb data: {n_samples} samples, {n_ch} ch")
+
+        if self._session is not None and self._write_arb_via_fifo(data, n_samples, n_ch):
+            return
+
+        # --- Register fallback ---
+        # Single lock acquisition for the whole transfer: no per-sample
+        # lock/unlock overhead, no _append_log per write, no ready_to_write
+        # polling (LabVIEW doesn't poll it either).
         buf_names = ["data_buffer_1", "data_buffer2", "data_buffer3"]
-        self._log(f"Writing arb data: {n_samples} samples, {n_cols} ch")
-        for i in range(n_samples):
-            for _ in range(1000):
-                if self.read_register("ready_to_write"):
-                    break
-                time.sleep(0.001)
-            self.write_register("write_address", i)
-            for c in range(min(n_cols, 3)):
-                self.write_register(buf_names[c], int(round(data[i, c])))
+        int_data = np.round(data[:, :n_ch]).astype(int)
+        addr_reg = REGISTER_MAP["write_address"]
+        buf_regs  = [REGISTER_MAP[buf_names[c]] for c in range(n_ch)]
+        with self._lock:
+            for i in range(n_samples):
+                self._write_one("write_address", i, addr_reg)
+                for c in range(n_ch):
+                    self._write_one(buf_names[c], int(int_data[i, c]), buf_regs[c])
         self._log(f"Arb write complete: {n_samples} samples")
+        _append_log("arb_write", {"samples": n_samples, "channels": n_ch})
+
+    def _write_arb_via_fifo(self, data, n_samples: int, n_ch: int) -> bool:
+        """Attempt to write arb data via DMA FIFO.  Returns True on success.
+
+        The bitfile must expose one H2T FIFO per channel.  On first call the
+        available FIFOs are logged so the user can identify the correct names
+        and set ARB_FIFO_NAMES on this instance.
+
+        To enable: set  ctrl.ARB_FIFO_NAMES = ["<ch0 fifo>", "<ch1 fifo>", ...]
+        after connecting (names from the [arb] FIFO log printed at connect).
+        """
+        import numpy as np
+        fifo_names = getattr(self, "ARB_FIFO_NAMES", None)
+        if not fifo_names:
+            return False
+        try:
+            fifos = self._session.fifos
+            for c in range(n_ch):
+                name = fifo_names[c] if c < len(fifo_names) else None
+                if name is None or name not in fifos:
+                    self._log(f"[arb] FIFO {name!r} not found — falling back to register write")
+                    return False
+                fifo = fifos[name]
+                dtype = getattr(fifo, "datatype", np.int32)
+                col = data[:, c].astype(dtype)
+                fifo.write(col, timeout_ms=60000)
+            self._log(f"Arb FIFO write complete: {n_samples} samples")
+            _append_log("arb_write", {"samples": n_samples, "channels": n_ch, "method": "fifo"})
+            return True
+        except Exception as exc:
+            self._log(f"[arb] FIFO write failed: {exc} — falling back to register write")
+            return False
 
     def load_arb_waveform(self, filepath: Path | str) -> None:
         """Load waveform data from a text file and write to FPGA buffers.
