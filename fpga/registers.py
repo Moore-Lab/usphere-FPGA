@@ -201,7 +201,7 @@ REGISTERS: list[RegisterDef] = [
     RegisterDef("data_buffer2",           Category.ARB_WAVEFORM, is_integer=True, description="Data buffer 2"),
     RegisterDef("data_buffer3",           Category.ARB_WAVEFORM, is_integer=True, description="Data buffer 3"),
     RegisterDef("Arb steps per cycle",    Category.ARB_WAVEFORM, is_integer=True, description="Steps per waveform cycle"),
-    RegisterDef("ready_to_write",         Category.ARB_WAVEFORM, Access.READ, description="Buffer write ready"),
+    RegisterDef("ready_to_write",         Category.ARB_WAVEFORM, is_bool=True, description="Host sets True to latch sample into buffer"),
     RegisterDef("written_address",        Category.ARB_WAVEFORM, Access.READ, is_integer=True, description="Last written address"),
 
     # --- EOM ---
