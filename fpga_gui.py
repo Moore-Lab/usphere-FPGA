@@ -691,6 +691,7 @@ class FPGAWidget(QWidget):
         self._wd_mc_stop_flag: list[bool] = [False]
         self._wd_has_plot: bool = False  # set in _build_waveform_designer
         self._wd_last_count_usec: float | None = None  # last FPGA Count(uSec)
+        self._wd_sample_rate: float = 1e6              # 1e6 / Count(uSec)
 
         # Session state
         self._session_state: dict = {}         # loaded by _restore_full_state
@@ -1123,10 +1124,11 @@ class FPGAWidget(QWidget):
         r1.addWidget(self._wd_npoints_combo)
         r1.addSpacing(8)
         r1.addWidget(QLabel("Sa/s:"))
-        self._wd_samplerate_edit = QLineEdit("1000000")
-        self._wd_samplerate_edit.setFixedWidth(90)
-        self._wd_samplerate_edit.textChanged.connect(self._on_wd_params_changed)
-        r1.addWidget(self._wd_samplerate_edit)
+        self._wd_samplerate_lbl = QLabel("—")
+        self._wd_samplerate_lbl.setFixedWidth(90)
+        self._wd_samplerate_lbl.setToolTip("1e6 / Count(uSec) — updated from FPGA")
+        self._wd_samplerate_lbl.setStyleSheet("color: #1e40af; font-weight: bold;")
+        r1.addWidget(self._wd_samplerate_lbl)
         r1.addSpacing(8)
         r1.addWidget(QLabel("Bits:"))
         self._wd_bits_spin = QSpinBox()
@@ -1987,9 +1989,11 @@ class FPGAWidget(QWidget):
         count_usec = values.get("Count(uSec)")
         if count_usec and count_usec != self._wd_last_count_usec:
             self._wd_last_count_usec = count_usec
-            sample_rate = int(round(1e6 / count_usec))
-            self._wd_samplerate_edit.setText(str(sample_rate))
+            self._wd_sample_rate = 1e6 / count_usec
+            sr_int = int(round(self._wd_sample_rate))
+            self._wd_samplerate_lbl.setText(f"{sr_int:,}")
             self._player_count_usec_spin.setValue(int(round(count_usec)))
+            self._on_wd_params_changed()
 
     def _on_plot_data(self, values: dict) -> None:
         self._plot_widget.push_values(values)
@@ -2149,7 +2153,7 @@ class FPGAWidget(QWidget):
         """Update derived frequency labels when points/sample-rate/cycles change."""
         try:
             n_points = int(self._wd_npoints_combo.currentText())
-            sample_rate = float(self._wd_samplerate_edit.text() or "1e6")
+            sample_rate = self._wd_sample_rate
         except ValueError:
             return
         for ncycles_spin, freq_lbl in [
@@ -2174,7 +2178,7 @@ class FPGAWidget(QWidget):
         """Refresh the frequency / Vpp / DC readout label."""
         try:
             n_points    = int(self._wd_npoints_combo.currentText())
-            sample_rate = float(self._wd_samplerate_edit.text() or "1e6")
+            sample_rate = self._wd_sample_rate
             tab_idx     = self._wd_type_tabs.currentIndex()
             if tab_idx == 0:
                 n_cyc = self._wd_sine_ncycles.value()
@@ -2266,7 +2270,7 @@ class FPGAWidget(QWidget):
 
         tab_idx = self._wd_type_tabs.currentIndex()
         try:
-            sample_rate = float(self._wd_samplerate_edit.text() or "1e6")
+            sample_rate = self._wd_sample_rate
 
             if tab_idx == 0:        # Sine
                 n_cyc = self._wd_sine_ncycles.value()
@@ -2360,7 +2364,7 @@ class FPGAWidget(QWidget):
         self._wd_mc_worker = None
         try:
             n_points = int(self._wd_npoints_combo.currentText())
-            sample_rate = float(self._wd_samplerate_edit.text() or "1e6")
+            sample_rate = self._wd_sample_rate
         except ValueError:
             return
         int_samples = self._wd_get_int_samples(result.samples)
