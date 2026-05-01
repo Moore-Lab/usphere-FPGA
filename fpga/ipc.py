@@ -54,7 +54,7 @@ shake_events.jsonl — one JSON object per line, oldest first:
 
 Reading shake events for an h5 recording window
 ------------------------------------------------
-    from fpga_ipc import read_shake_events_in_window
+    from fpga.ipc import read_shake_events_in_window
     events = read_shake_events_in_window(t_start_utc, t_end_utc)
     # returns list[dict], each dict has ts_utc, kind, amplitude_vpp, step
 """

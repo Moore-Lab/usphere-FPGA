@@ -51,11 +51,11 @@ from PyQt5.QtWidgets import (
     QWidget,
 )
 
-from fpga_core import FPGAConfig, FPGAController, _append_log
+from fpga.core import FPGAConfig, FPGAController, _append_log
 from session_state import load_state as _load_session_state, save_state as _save_session_state
 from modules import discover_hardware_modules
 from procedures.base import LiveFPGAFacade
-from fpga_registers import (
+from fpga.registers import (
     Access,
     Category,
     HOST_PARAM_DEFAULTS,
@@ -67,8 +67,8 @@ from fpga_registers import (
     names_by_category,
     writable_registers,
 )
-from fpga_plot import ALL_PLOT_NAMES, FPGAPlotWidget
-from fpga_ipc import TICPublisher
+from fpga.plot import ALL_PLOT_NAMES, FPGAPlotWidget
+from fpga.ipc import TICPublisher
 from arb_waveform import (
     WaveformResult,
     generate_comb,

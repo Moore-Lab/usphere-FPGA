@@ -68,7 +68,7 @@ from PyQt5.QtWidgets import (
 import modules.mod_keysight_awg as _awg
 import modules.mod_tenma_psu   as _psu
 from procedures.base import ControlProcedure
-from fpga_ipc import ShakeEventLogger
+from fpga.ipc import ShakeEventLogger
 
 # ---------------------------------------------------------------------------
 # State file

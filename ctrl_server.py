@@ -63,7 +63,7 @@ if str(_HERE) not in sys.path:
     sys.path.insert(0, str(_HERE))
 
 from zmq_base import ModuleServer
-from fpga_core import FPGAConfig, FPGAController
+from fpga.core import FPGAConfig, FPGAController
 
 log = logging.getLogger(__name__)
 
