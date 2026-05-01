@@ -1426,6 +1426,12 @@ class FPGAWidget(QWidget):
         load_btn = QPushButton("Load & Preview")
         load_btn.clicked.connect(self._on_player_load)
         r1.addWidget(load_btn)
+        null_btn = QPushButton("Null Col")
+        null_btn.setToolTip(
+            "Append a column of zeros matching the length of the loaded waveform. "
+            "Fills the next empty channel slot (ch0 → ch1 → ch2).")
+        null_btn.clicked.connect(self._on_player_null_col)
+        r1.addWidget(null_btn)
         self._player_write_btn = QPushButton("Write to FPGA")
         self._player_write_btn.setStyleSheet(
             "QPushButton { padding: 4px 10px; background-color: #059669; "
@@ -1819,6 +1825,15 @@ class FPGAWidget(QWidget):
                 "Trapping":      state.get("trapping", {}),
             })
             self._resources.restore_ui_states(resources_data)
+            vac = state.get("vacuum", {})
+            if vac.get("tic_port"):
+                self._tic_port_edit.setText(vac["tic_port"])
+            if vac.get("tic_baud"):
+                self._tic_baud_edit.setText(vac["tic_baud"])
+            if vac.get("sv_port"):
+                self._sv_port_edit.setText(vac["sv_port"])
+            if vac.get("bv_port"):
+                self._bv_port_edit.setText(vac["bv_port"])
         except Exception as exc:
             self._append_status(f"Session restore warning: {exc}")
 
@@ -1842,6 +1857,12 @@ class FPGAWidget(QWidget):
         if self._last_register_values:
             state["registers"] = dict(self._last_register_values)
         state["resources"] = self._resources.get_ui_states()
+        state["vacuum"] = {
+            "tic_port":  self._tic_port_edit.text(),
+            "tic_baud":  self._tic_baud_edit.text(),
+            "sv_port":   self._sv_port_edit.text(),
+            "bv_port":   self._bv_port_edit.text(),
+        }
         return state
 
     def _autosave_state(self) -> None:
@@ -2483,16 +2504,36 @@ class FPGAWidget(QWidget):
         if path:
             self._arb_file_edit.setText(path)
 
+    def _on_player_null_col(self) -> None:
+        """Fill the next empty player channel with zeros."""
+        ref = next((d for d in self._player_data if d is not None), None)
+        if ref is None:
+            self._append_status("Load a waveform first before adding a null column.")
+            return
+        slot = next((i for i, d in enumerate(self._player_data) if d is None), None)
+        if slot is None:
+            self._append_status("All 3 channels already loaded.")
+            return
+        self._player_data[slot] = np.zeros(len(ref))
+        if self._player_has_plot:
+            self._player_tabs.setTabVisible(slot, True)
+        self._on_player_display_changed()
+        self._append_status(f"Null column added to ch{slot} ({len(ref)} zeros).")
+
     def _on_write_arb_buffers(self) -> None:
         if not self._ctrl.is_connected:
             self._append_status("Not connected.")
             return
-        filepath = self._arb_file_edit.text().strip()
-        if not filepath:
-            self._append_status("No arb waveform file selected.")
+        loaded = [(i, d) for i, d in enumerate(self._player_data) if d is not None]
+        if not loaded:
+            self._append_status("No waveform loaded. Use 'Load & Preview' first.")
             return
+        n = len(loaded[0][1])
+        cols = [d[:n] for _, d in loaded]
+        data = np.column_stack(cols) if len(cols) > 1 else cols[0].reshape(-1, 1)
         try:
-            self._ctrl.load_arb_waveform(filepath)
+            self._ctrl.write_arb_data(data)
+            self._append_status(f"Arb written: {n} pts × {len(cols)} col(s)")
         except Exception as exc:
             self._append_status(f"Arb load failed: {exc}")
 

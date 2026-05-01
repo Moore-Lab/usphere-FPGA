@@ -372,38 +372,46 @@ class FPGAController:
     # Arb waveform buffer loading
     # ------------------------------------------------------------------
 
-    def load_arb_waveform(self, filepath: Path | str) -> None:
-        """Load waveform data from a text file and write to FPGA buffers.
+    def write_arb_data(self, data) -> None:
+        """Write a pre-loaded numpy array to the FPGA arb buffers.
 
-        The file should contain one sample per line with up to 3 columns
-        (whitespace- or comma-separated) corresponding to data_buffer_1,
-        data_buffer2, and data_buffer3.  The host writes one sample at a
-        time using the write_address / ready_to_write handshake.
+        data : 1-D or 2-D array; up to 3 columns map to data_buffer_1/2/3.
         """
         import numpy as np
-
-        filepath = Path(filepath)
-        data = np.loadtxt(str(filepath), delimiter=None)
+        data = np.asarray(data, dtype=float)
         if data.ndim == 1:
             data = data.reshape(-1, 1)
         n_samples, n_cols = data.shape
         buf_names = ["data_buffer_1", "data_buffer2", "data_buffer3"]
-
-        self._log(f"Loading arb waveform: {filepath.name} ({n_samples} samples, {n_cols} ch)")
-
+        self._log(f"Writing arb data: {n_samples} samples, {n_cols} ch")
         for i in range(n_samples):
-            # Wait for FPGA to be ready
             for _ in range(1000):
                 if self.read_register("ready_to_write"):
                     break
                 time.sleep(0.001)
-
             self.write_register("write_address", i)
             for c in range(min(n_cols, 3)):
-                self.write_register(buf_names[c], float(data[i, c]))
+                self.write_register(buf_names[c], data[i, c])
+        self._log(f"Arb write complete: {n_samples} samples")
 
-        self._log(f"Arb waveform loaded: {n_samples} samples")
-        _append_log("arb_load", {"file": str(filepath), "samples": n_samples})
+    def load_arb_waveform(self, filepath: Path | str) -> None:
+        """Load waveform data from a text file and write to FPGA buffers.
+
+        Accepts comma- or whitespace-delimited files with up to 3 columns
+        corresponding to data_buffer_1, data_buffer2, and data_buffer3.
+        """
+        import numpy as np
+
+        filepath = Path(filepath)
+        with open(filepath, "r") as f:
+            first_line = f.readline()
+        delimiter = "," if "," in first_line else None
+        data = np.loadtxt(str(filepath), delimiter=delimiter)
+        if data.ndim == 1:
+            data = data.reshape(-1, 1)
+        self._log(f"Loading arb waveform: {filepath.name} ({data.shape[0]} samples, {data.shape[1]} ch)")
+        self.write_arb_data(data)
+        _append_log("arb_load", {"file": str(filepath), "samples": data.shape[0]})
 
     # ------------------------------------------------------------------
     # Save / load sphere parameters
