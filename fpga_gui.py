@@ -1359,7 +1359,7 @@ class FPGAWidget(QWidget):
         self._wd_type_tabs.currentChanged.connect(self._on_wd_params_changed)
         layout.addWidget(self._wd_type_tabs)
 
-        # Generate / Cancel / Save row
+        # Generate / Cancel / Save / Null row
         gen_row = QHBoxLayout()
         self._wd_gen_btn = QPushButton("Generate → Col")
         self._wd_gen_btn.setStyleSheet(
@@ -1380,11 +1380,28 @@ class FPGAWidget(QWidget):
         save_btn = QPushButton("Write CSV…")
         save_btn.clicked.connect(self._on_wd_save)
         gen_row.addWidget(save_btn)
+        wd_null_btn = QPushButton("Null Col")
+        wd_null_btn.setToolTip(
+            "Fill the active column with zeros (all DAC counts = 0).")
+        wd_null_btn.clicked.connect(self._on_wd_null_col)
+        gen_row.addWidget(wd_null_btn)
         self._wd_desc_lbl = QLabel("")
         self._wd_desc_lbl.setStyleSheet(
             "color: #6b7280; font-size: 10px; font-style: italic;")
         gen_row.addWidget(self._wd_desc_lbl, 1)
         layout.addLayout(gen_row)
+
+        # Live readout: frequency, Vpp, DC offset
+        self._wd_info_lbl = QLabel("")
+        self._wd_info_lbl.setStyleSheet(
+            "color: #1e40af; font-size: 11px; font-weight: bold; padding: 1px 0;")
+        layout.addWidget(self._wd_info_lbl)
+
+        # Connect amplitude / DC / cal edits so the readout updates live
+        self._wd_amplitude_spin.valueChanged.connect(self._wd_update_info_lbl)
+        self._wd_dc_spin.valueChanged.connect(self._wd_update_info_lbl)
+        self._wd_volt_cal_counts.textChanged.connect(self._wd_update_info_lbl)
+        self._wd_volt_cal_v.textChanged.connect(self._wd_update_info_lbl)
 
         # Preview plot with twin x-axis (sample index bottom, time top)
         try:
@@ -1426,12 +1443,6 @@ class FPGAWidget(QWidget):
         load_btn = QPushButton("Load & Preview")
         load_btn.clicked.connect(self._on_player_load)
         r1.addWidget(load_btn)
-        null_btn = QPushButton("Null Col")
-        null_btn.setToolTip(
-            "Append a column of zeros matching the length of the loaded waveform. "
-            "Fills the next empty channel slot (ch0 → ch1 → ch2).")
-        null_btn.clicked.connect(self._on_player_null_col)
-        r1.addWidget(null_btn)
         self._player_write_btn = QPushButton("Write to FPGA")
         self._player_write_btn.setStyleSheet(
             "QPushButton { padding: 4px 10px; background-color: #059669; "
@@ -2150,6 +2161,44 @@ class FPGAWidget(QWidget):
                     freq_lbl.setText(f"→ {freq:.3f} Hz")
             else:
                 freq_lbl.setText("")
+        self._wd_update_info_lbl()
+
+    def _wd_update_info_lbl(self, *_) -> None:
+        """Refresh the frequency / Vpp / DC readout label."""
+        try:
+            n_points    = int(self._wd_npoints_combo.currentText())
+            sample_rate = float(self._wd_samplerate_edit.text() or "1e6")
+            tab_idx     = self._wd_type_tabs.currentIndex()
+            if tab_idx == 0:
+                n_cyc = self._wd_sine_ncycles.value()
+            elif tab_idx == 1:
+                n_cyc = self._wd_tri_ncycles.value()
+            elif tab_idx == 2:
+                n_cyc = self._wd_trap_ncycles.value()
+            else:
+                n_cyc = None  # Freq Comb — no single frequency
+            if n_cyc is not None and n_points > 0 and sample_rate > 0:
+                freq_hz = sample_rate * n_cyc / n_points
+                if freq_hz >= 1e6:
+                    freq_str = f"{freq_hz / 1e6:.4f} MHz"
+                elif freq_hz >= 1e3:
+                    freq_str = f"{freq_hz / 1e3:.3f} kHz"
+                else:
+                    freq_str = f"{freq_hz:.3f} Hz"
+            else:
+                freq_str = "mixed"
+            cal_cts = float(self._wd_volt_cal_counts.text() or "2047")
+            cal_v   = float(self._wd_volt_cal_v.text() or "10")
+            amp_cts = self._wd_amplitude_spin.value()
+            dc_cts  = self._wd_dc_spin.value()
+            vpp_v   = (amp_cts * 2 * cal_v / cal_cts) if cal_cts != 0 else 0
+            dc_v    = (dc_cts * cal_v / cal_cts)       if cal_cts != 0 else 0
+            self._wd_info_lbl.setText(
+                f"f = {freq_str}    "
+                f"Vpp = {vpp_v:.3f} V ({amp_cts * 2} cts)    "
+                f"DC = {dc_v:.3f} V ({dc_cts} cts)")
+        except (ValueError, ZeroDivisionError):
+            self._wd_info_lbl.setText("")
 
     def _on_wd_resolution_changed(self, bits: int) -> None:
         max_count = 2 ** (bits - 1) - 1
@@ -2273,6 +2322,19 @@ class FPGAWidget(QWidget):
 
         except Exception as exc:
             self._append_status(f"Waveform generate error: {exc}")
+
+    def _on_wd_null_col(self) -> None:
+        """Fill the active generator column with zeros."""
+        try:
+            n = int(self._wd_npoints_combo.currentText())
+        except ValueError:
+            return
+        zeros = np.zeros(n, dtype=np.int32)
+        self._wd_columns[self._wd_active_col] = zeros
+        self._wd_desc_lbl.setText(
+            f"Col {self._wd_active_col + 1} set to zeros  ({n} pts)")
+        if self._wd_has_plot:
+            self._wd_plot_curve.setData(np.arange(n), zeros)
 
     def _on_wd_cancel(self) -> None:
         self._wd_mc_stop_flag[0] = True
