@@ -20,11 +20,12 @@ PSD is on-demand only (Compute PSD button opens a matplotlib dialog).
 
 from __future__ import annotations
 
+import queue
 import time
 
 import numpy as np
 import pyqtgraph as pg
-from PyQt5.QtCore import Qt, QSettings, QTimer, pyqtSignal
+from PyQt5.QtCore import Qt, QSettings, QTimer
 from PyQt5.QtWidgets import (
     QCheckBox,
     QComboBox,
@@ -230,22 +231,28 @@ class PSDDialog(QDialog):
 class FPGAPlotWidget(QWidget):
     """3×3 pyqtgraph grid (X/Y/Z × sensor/feedback/total_feedback).
 
-    Embed this directly in a tab.  Data is pushed via push_values();
-    a QTimer redraws at ~60 fps by updating curve data in-place.
-    """
+    Data flow:
+      Monitor thread  →  push_values()  →  SimpleQueue  (no Qt overhead)
+      Draw timer (33 ms)  →  _drain_queue()  →  ring buffers  →  redraw
 
-    # Signal used to safely deliver data from the monitor background thread
-    # to the Qt main thread (queued connection across thread boundary).
-    _incoming = pyqtSignal(dict)
+    The queue decouples the fast poll loop from Qt rendering: the monitor
+    thread can poll at 1 kHz without emitting a signal or touching the
+    event loop on every sample.  All ring-buffer writes and curve updates
+    happen on the main thread inside the 33 ms draw timer.
+    """
 
     HISTORY_SEC = 10.0    # visible window (seconds)
     BUF_CAPACITY = 20000  # ring-buffer size (10 s @ 2 kHz)
-    REFRESH_MS = 33       # ~30 fps redraw timer (less GPU contention)
+    REFRESH_MS = 33       # ~30 fps redraw timer
 
     def __init__(self, parent=None):
         super().__init__(parent)
         self._t0 = time.monotonic()
         self._dirty = False
+
+        # Thread-safe accumulator: monitor thread puts (t, values_dict) here.
+        # Main thread drains it in _redraw — no Qt signals, no event-loop load.
+        self._q: queue.SimpleQueue = queue.SimpleQueue()
 
         # Time ring buffer
         self._times = _RingBuffer(self.BUF_CAPACITY)
@@ -256,10 +263,6 @@ class FPGAPlotWidget(QWidget):
         self._plots: dict[str, pg.PlotItem] = {}
 
         self._build_ui()
-
-        # Queued connection: monitor thread emits _incoming → main thread runs
-        # _receive_values, so ring-buffer writes always happen on the main thread.
-        self._incoming.connect(self._receive_values)
 
         self._timer = QTimer(self)
         self._timer.timeout.connect(self._redraw)
@@ -312,22 +315,34 @@ class FPGAPlotWidget(QWidget):
     # ── Public API ────────────────────────────────────────────────────
 
     def push_values(self, values: dict[str, float]) -> None:
-        """Thread-safe entry point — may be called from any thread.
+        """Thread-safe, non-blocking — called from monitor thread.
 
-        Emits _incoming so the actual buffer write happens on the main thread,
-        eliminating the torn-read race with the redraw timer.
+        Timestamps the snapshot and drops it into the queue.  No Qt signal
+        emission, no event-loop wakeup — the draw timer drains it.
         """
-        self._incoming.emit(values)
+        self._q.put_nowait((time.monotonic() - self._t0, values))
 
-    def _receive_values(self, values: dict[str, float]) -> None:
-        """Runs on the main thread via queued signal connection."""
-        t = time.monotonic() - self._t0
-        self._times.append(t)
-        for reg_name, buf in self._bufs.items():
-            buf.append(values.get(reg_name, 0.0))
-        self._dirty = True
+    def _drain_queue(self) -> int:
+        """Drain all queued snapshots into ring buffers. Returns count added."""
+        n = 0
+        try:
+            while True:
+                t, values = self._q.get_nowait()
+                self._times.append(t)
+                for reg_name, buf in self._bufs.items():
+                    buf.append(values.get(reg_name, 0.0))
+                n += 1
+        except queue.Empty:
+            pass
+        return n
 
     def clear(self) -> None:
+        # Discard any queued samples
+        try:
+            while True:
+                self._q.get_nowait()
+        except queue.Empty:
+            pass
         self._times.clear()
         for buf in self._bufs.values():
             buf.clear()
@@ -337,6 +352,10 @@ class FPGAPlotWidget(QWidget):
     # ── Timer-driven redraw ───────────────────────────────────────────
 
     def _redraw(self) -> None:
+        # Drain accumulator first — all ring-buffer writes happen here on
+        # the main thread, so no locking needed with the draw logic below.
+        if self._drain_queue() > 0:
+            self._dirty = True
         if not self._dirty:
             return
         self._dirty = False
