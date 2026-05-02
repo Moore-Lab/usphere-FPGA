@@ -44,7 +44,7 @@ from matplotlib.figure import Figure
 
 # ── pyqtgraph global config ──────────────────────────────────────────────
 
-pg.setConfigOptions(antialias=False, useOpenGL=True)
+pg.setConfigOptions(antialias=True, useOpenGL=True)
 
 # ── 3×3 grid definition ──────────────────────────────────────────────────
 
@@ -295,7 +295,7 @@ class FPGAPlotWidget(QWidget):
                 p = self._gw.addPlot(row=r, col=c, title=title)
                 p.setLabel("bottom", "Time", units="s")
                 p.showGrid(x=True, y=True, alpha=0.25)
-                p.setDownsampling(auto=True, mode="peak")
+                p.setDownsampling(auto=True, mode="mean")
                 p.setClipToView(True)
                 p.enableAutoRange(axis="y")
                 p.setAutoVisible(y=True)
