@@ -91,7 +91,7 @@ class FPGAConfig:
     )
     resource: str = "PXI1Slot2"
     poll_interval_ms: int = 200     # how often the monitor reads all registers
-    plot_interval_ms: int = 10      # fast poll rate for plot indicators (ms)
+    plot_interval_ms: int = 2       # fast poll rate for plot indicators (ms)
 
     def to_dict(self) -> dict:
         return {
