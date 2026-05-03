@@ -20,12 +20,14 @@ PSD is on-demand only (Compute PSD button opens a matplotlib dialog).
 
 from __future__ import annotations
 
-import queue
+import csv
 import time
+from datetime import datetime
+from pathlib import Path
 
 import numpy as np
 import pyqtgraph as pg
-from PyQt5.QtCore import Qt, QSettings, QTimer
+from PyQt5.QtCore import Qt, QSettings, QTimer, pyqtSignal
 from PyQt5.QtWidgets import (
     QCheckBox,
     QComboBox,
@@ -45,7 +47,7 @@ from matplotlib.figure import Figure
 
 # ── pyqtgraph global config ──────────────────────────────────────────────
 
-pg.setConfigOptions(antialias=True, useOpenGL=True)
+pg.setConfigOptions(antialias=False, useOpenGL=True)
 
 # ── 3×3 grid definition ──────────────────────────────────────────────────
 
@@ -231,28 +233,36 @@ class PSDDialog(QDialog):
 class FPGAPlotWidget(QWidget):
     """3×3 pyqtgraph grid (X/Y/Z × sensor/feedback/total_feedback).
 
-    Data flow:
-      Monitor thread  →  push_values()  →  SimpleQueue  (no Qt overhead)
-      Draw timer (33 ms)  →  _drain_queue()  →  ring buffers  →  redraw
-
-    The queue decouples the fast poll loop from Qt rendering: the monitor
-    thread can poll at 1 kHz without emitting a signal or touching the
-    event loop on every sample.  All ring-buffer writes and curve updates
-    happen on the main thread inside the 33 ms draw timer.
+    Embed this directly in a tab.  Data flow:
+      • push_values() is called every POLL_MS (10 ms) by the monitor thread
+        and appends one sample to the ring buffers (thread-safe via signal).
+      • A QTimer fires every REFRESH_MS (200 ms) and redraws all curves from
+        the ring buffers — no reads happen on the monitor thread at plot time.
     """
+
+    # Signal used to safely deliver data from the monitor background thread
+    # to the Qt main thread (queued connection across thread boundary).
+    _incoming = pyqtSignal(dict)
 
     HISTORY_SEC = 10.0    # visible window (seconds)
     BUF_CAPACITY = 20000  # ring-buffer size (10 s @ 2 kHz)
-    REFRESH_MS = 33       # ~30 fps redraw timer
+    POLL_MS    = 10       # expected data rate: one sample added every 10 ms
+    REFRESH_MS = 200      # plot redraws every 200 ms (~5 fps) from ring buffer
+
+    # Path for recordings (project_root/recordings/)
+    _RECORD_DIR = Path(__file__).resolve().parent.parent / "recordings"
 
     def __init__(self, parent=None):
         super().__init__(parent)
         self._t0 = time.monotonic()
         self._dirty = False
 
-        # Thread-safe accumulator: monitor thread puts (t, values_dict) here.
-        # Main thread drains it in _redraw — no Qt signals, no event-loop load.
-        self._q: queue.SimpleQueue = queue.SimpleQueue()
+        # Recording state
+        self._recording:      bool = False
+        self._record_fh              = None   # open file handle
+        self._record_writer          = None   # csv.writer
+        self._record_path: Path|None = None
+        self._record_btn:   QPushButton|None = None
 
         # Time ring buffer
         self._times = _RingBuffer(self.BUF_CAPACITY)
@@ -263,6 +273,10 @@ class FPGAPlotWidget(QWidget):
         self._plots: dict[str, pg.PlotItem] = {}
 
         self._build_ui()
+
+        # Queued connection: monitor thread emits _incoming → main thread runs
+        # _receive_values, so ring-buffer writes always happen on the main thread.
+        self._incoming.connect(self._receive_values)
 
         self._timer = QTimer(self)
         self._timer.timeout.connect(self._redraw)
@@ -282,6 +296,20 @@ class FPGAPlotWidget(QWidget):
         clear_btn = QPushButton("Clear")
         clear_btn.clicked.connect(self.clear)
         top.addWidget(clear_btn)
+
+        self._record_btn = QPushButton("● Record")
+        self._record_btn.setCheckable(True)
+        self._record_btn.setStyleSheet(
+            "QPushButton { color: #dc2626; font-weight: bold; padding: 3px 10px; }"
+            "QPushButton:checked { background-color: #dc2626; color: white; border-radius: 3px; }"
+        )
+        self._record_btn.toggled.connect(self._on_record_toggled)
+        top.addWidget(self._record_btn)
+
+        self._record_lbl = QLabel("")
+        self._record_lbl.setStyleSheet("color: #6b7280; font-size: 10px;")
+        top.addWidget(self._record_lbl)
+
         top.addStretch()
         layout.addLayout(top)
 
@@ -298,7 +326,7 @@ class FPGAPlotWidget(QWidget):
                 p = self._gw.addPlot(row=r, col=c, title=title)
                 p.setLabel("bottom", "Time", units="s")
                 p.showGrid(x=True, y=True, alpha=0.25)
-                p.setDownsampling(auto=True, mode="mean")
+                p.setDownsampling(auto=True, mode="peak")
                 p.setClipToView(True)
                 p.enableAutoRange(axis="y")
                 p.setAutoVisible(y=True)
@@ -315,47 +343,67 @@ class FPGAPlotWidget(QWidget):
     # ── Public API ────────────────────────────────────────────────────
 
     def push_values(self, values: dict[str, float]) -> None:
-        """Thread-safe, non-blocking — called from monitor thread.
+        """Thread-safe entry point — may be called from any thread.
 
-        Timestamps the snapshot and drops it into the queue.  No Qt signal
-        emission, no event-loop wakeup — the draw timer drains it.
+        Emits _incoming so the actual buffer write happens on the main thread,
+        eliminating the torn-read race with the redraw timer.
         """
-        self._q.put_nowait((time.monotonic() - self._t0, values))
+        self._incoming.emit(values)
 
-    def _drain_queue(self) -> int:
-        """Drain all queued snapshots into ring buffers. Returns count added."""
-        n = 0
-        try:
-            while True:
-                t, values = self._q.get_nowait()
-                self._times.append(t)
-                for reg_name, buf in self._bufs.items():
-                    buf.append(values.get(reg_name, 0.0))
-                n += 1
-        except queue.Empty:
-            pass
-        return n
+    def _receive_values(self, values: dict[str, float]) -> None:
+        """Runs on the main thread via queued signal connection."""
+        t = time.monotonic() - self._t0
+        self._times.append(t)
+        for reg_name, buf in self._bufs.items():
+            buf.append(values.get(reg_name, 0.0))
+        self._dirty = True
+
+        if self._recording and self._record_writer is not None:
+            row = [f"{t:.6f}"] + [f"{values.get(n, 0.0):.6f}" for n in ALL_PLOT_NAMES]
+            self._record_writer.writerow(row)
+            self._record_fh.flush()
 
     def clear(self) -> None:
-        # Discard any queued samples
-        try:
-            while True:
-                self._q.get_nowait()
-        except queue.Empty:
-            pass
         self._times.clear()
         for buf in self._bufs.values():
             buf.clear()
         self._t0 = time.monotonic()
         self._dirty = True
 
+    # ── Recording ─────────────────────────────────────────────────────
+
+    def _on_record_toggled(self, checked: bool) -> None:
+        if checked:
+            self._start_recording()
+        else:
+            self._stop_recording()
+
+    def _start_recording(self) -> None:
+        self._RECORD_DIR.mkdir(parents=True, exist_ok=True)
+        ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+        self._record_path = self._RECORD_DIR / f"arb_diag_{ts}.csv"
+        self._record_fh = open(self._record_path, "w", newline="")
+        self._record_writer = csv.writer(self._record_fh)
+        header = ["t_s"] + [n.replace(" plot", "").replace(" ", "_") for n in ALL_PLOT_NAMES]
+        self._record_writer.writerow(header)
+        self._recording = True
+        if self._record_lbl:
+            self._record_lbl.setText(f"→ {self._record_path.name}")
+
+    def _stop_recording(self) -> None:
+        self._recording = False
+        if self._record_fh is not None:
+            self._record_fh.close()
+            self._record_fh = None
+            self._record_writer = None
+        if self._record_lbl and self._record_path:
+            self._record_lbl.setText(f"Saved: {self._record_path.name}")
+        if self._record_btn and self._record_btn.isChecked():
+            self._record_btn.setChecked(False)
+
     # ── Timer-driven redraw ───────────────────────────────────────────
 
     def _redraw(self) -> None:
-        # Drain accumulator first — all ring-buffer writes happen here on
-        # the main thread, so no locking needed with the draw logic below.
-        if self._drain_queue() > 0:
-            self._dirty = True
         if not self._dirty:
             return
         self._dirty = False

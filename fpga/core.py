@@ -91,7 +91,7 @@ class FPGAConfig:
     )
     resource: str = "PXI1Slot2"
     poll_interval_ms: int = 200     # how often the monitor reads all registers
-    plot_interval_ms: int = 1       # fast poll rate for plot indicators (ms)
+    plot_interval_ms: int = 10      # fast poll rate for plot indicators (ms)
 
     def to_dict(self) -> dict:
         return {
@@ -408,43 +408,66 @@ class FPGAController:
             return
 
         # --- Register write path ---
-        # Bitfile analysis: ready_to_write is HOST-written (Indicator=false).
-        # The FPGA latches memory[write_address] ← data_buffer while ready_to_write=True.
-        # Holding it True for the whole loop causes a race: the FPGA sees the new address
-        # before the new data arrives, writing the previous sample's data to the new
-        # address → correct envelope but corrupted per-sample values.
-        #
-        # Fix: write data first (stable), then address, then pulse ready_to_write
-        # True→False per sample.  Use direct nifpga register objects to skip the
-        # per-call dictionary lookup and type-dispatch overhead of _write_one.
+        # Protocol derived from LabVIEW block diagram (docs/feedback…NEWd3.png):
+        # LabVIEW uses an atomic PCIe cluster write per sample so ready_to_write,
+        # write_address, and data_buffer all update simultaneously — no race.
+        # Python cannot do atomic multi-register writes, so we use per-sample
+        # True/False pulsing with written_address confirmation (blocking read)
+        # to guarantee the FPGA has seen each write before we proceed.
+        # A sentinel address (16384) is written after the final sample.
         buf_names = ["data_buffer_1", "data_buffer2", "data_buffer3"]
         int_data = np.clip(np.round(data[:, :n_ch]), -32768, 32767).astype(int)
         if self._session is not None:
-            # Fast path: direct nifpga register writes (no _write_one overhead)
-            nifpga_bufs = [self._session.registers[n] for n in buf_names[:n_ch]]
-            nifpga_addr = self._session.registers["write_address"]
-            nifpga_rtw  = self._session.registers["ready_to_write"]
+            # Protocol: for each sample, keep ready_to_write=False while
+            # writing data and address (no accidental latching), then pulse
+            # True and poll written_address (a blocking PCIe read) until the
+            # FPGA confirms it stored the sample.  The blocking read also
+            # flushes the posted True write so the FPGA is guaranteed to
+            # have seen it before we send False.  Per-sample pulsing is
+            # required because Python cannot do atomic multi-register writes
+            # like LabVIEW's cluster writes; without it, the FPGA could latch
+            # new data at the old address (or old data at the new address).
+            nifpga_bufs    = [self._session.registers[n] for n in buf_names[:n_ch]]
+            nifpga_addr    = self._session.registers["write_address"]
+            nifpga_rtw     = self._session.registers["ready_to_write"]
+            nifpga_written = self._session.registers["written_address"]
+            TIMEOUT_S = 1.0  # per-sample latch timeout
             with self._lock:
-                nifpga_rtw.write(False)
+                nifpga_rtw.write(False)  # start False — safe to write data/addr
                 for i in range(n_samples):
+                    # 1. Write data while rtw=False (no latch can occur)
                     for c in range(n_ch):
                         nifpga_bufs[c].write(int(int_data[i, c]))
+                    # 2. Write address while rtw=False (data+address now stable)
                     nifpga_addr.write(i)
+                    # 3. Pulse True — FPGA latches memory[i] = data_buffer
                     nifpga_rtw.write(True)
+                    # 4. Poll written_address (blocking read) until FPGA confirms.
+                    #    The read also flushes the posted True write so FPGA has
+                    #    processed it before we send False.
+                    t_end = time.monotonic() + TIMEOUT_S
+                    while nifpga_written.read() != i:
+                        if time.monotonic() >= t_end:
+                            self._log(f"[arb] written_address timeout at sample {i}")
+                            break
+                    # 5. Clear ready_to_write before next sample's data writes
                     nifpga_rtw.write(False)
+                # Sentinel + cleanup (mirrors LabVIEW's post-loop write)
+                nifpga_addr.write(16384)
+                # rtw already False from last iteration
         else:
             # Simulation path
             addr_reg = REGISTER_MAP["write_address"]
             rtw_reg  = REGISTER_MAP["ready_to_write"]
             buf_regs = [REGISTER_MAP[buf_names[c]] for c in range(n_ch)]
             with self._lock:
-                self._write_one("ready_to_write", False, rtw_reg)
+                self._write_one("ready_to_write", True, rtw_reg)
                 for i in range(n_samples):
                     for c in range(n_ch):
                         self._write_one(buf_names[c], int(int_data[i, c]), buf_regs[c])
                     self._write_one("write_address", i, addr_reg)
-                    self._write_one("ready_to_write", True, rtw_reg)
-                    self._write_one("ready_to_write", False, rtw_reg)
+                self._write_one("write_address", 16384, addr_reg)
+                self._write_one("ready_to_write", False, rtw_reg)
         self._log(f"Arb write complete: {n_samples} samples")
         _append_log("arb_write", {"samples": n_samples, "channels": n_ch})
 
