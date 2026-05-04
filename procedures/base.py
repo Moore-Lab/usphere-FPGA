@@ -112,6 +112,16 @@ class FPGAFacade:
         """
         raise NotImplementedError
 
+    # --- Sphere-caught callbacks ---
+
+    def add_sphere_caught_callback(self, cb) -> None:
+        """Register a callable invoked when a sphere-caught rising edge is detected."""
+        raise NotImplementedError
+
+    def notify_sphere_caught(self, data: dict) -> None:
+        """Fire all sphere_caught callbacks (called from TrappingPanel)."""
+        raise NotImplementedError
+
     # --- State ---
 
     @property
@@ -226,6 +236,12 @@ class LiveFPGAFacade(FPGAFacade):
 
     def change_pars(self, axis, host_params, pid_values=None):
         return self._ctrl.change_pars(axis, host_params, pid_values)
+
+    def add_sphere_caught_callback(self, cb) -> None:
+        self._ctrl.add_sphere_caught_callback(cb)
+
+    def notify_sphere_caught(self, data: dict) -> None:
+        self._ctrl.notify_sphere_caught(data)
 
     @property
     def is_connected(self) -> bool:
