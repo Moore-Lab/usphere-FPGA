@@ -621,6 +621,171 @@ class _TICPollWorker(QThread):
 
 
 # ---------------------------------------------------------------------------
+# Gain sweep worker — sets FPGA ARB gain and records via DAQ ZMQ
+# ---------------------------------------------------------------------------
+
+class _GainSweepWorker(QThread):
+    """
+    Background thread for a single gain sweep step-sequence.
+
+    cfg dict keys:
+        gains          : list[float]   — ordered gain values to step through
+        channels       : list[int]     — which Arb gain channels (0/1/2) to write
+        settle_s       : float         — settle time per step (s)
+        files_per_step : int
+        output_dir     : str
+        prefix         : str
+        sample_rate    : float (Hz)
+        n_bits         : int
+        ctrl_host      : str
+        ctrl_port      : int  (REP port of CTRL server)
+        daq_host       : str
+        daq_port       : int  (REP port of DAQ server)
+    """
+
+    log      = pyqtSignal(str)
+    progress = pyqtSignal(int, int)   # step, total
+    finished = pyqtSignal(bool)
+
+    def __init__(self, cfg: dict, parent=None):
+        super().__init__(parent)
+        self._cfg     = cfg
+        self._stop    = False
+
+    def stop(self):
+        self._stop = True
+
+    def run(self):
+        import time
+        cfg = self._cfg
+        gains         = cfg["gains"]
+        channels      = cfg["channels"]
+        settle_s      = float(cfg.get("settle_s", 2.0))
+        files_per     = int(cfg.get("files_per_step", 1))
+        output_dir    = cfg.get("output_dir", ".")
+        prefix        = cfg.get("prefix", "fpga_gain")
+        sample_rate   = float(cfg.get("sample_rate", 10000))
+        n_bits        = int(cfg.get("n_bits", 17))
+        ctrl_host     = cfg.get("ctrl_host", "localhost")
+        ctrl_port     = int(cfg.get("ctrl_port", 5550))
+        daq_host      = cfg.get("daq_host", "localhost")
+        daq_port      = int(cfg.get("daq_port", 5552))
+        ch_names      = [f"Arb gain (ch{c})" for c in channels]
+        n_total       = len(gains)
+
+        try:
+            from zmq_base import ModuleClient
+        except ImportError:
+            self.log.emit("ERROR: zmq_base not found — cannot connect to servers")
+            self.finished.emit(False)
+            return
+
+        ctrl = ModuleClient("ctrl", rep_port=ctrl_port, pub_port=ctrl_port + 1,
+                            host=ctrl_host, timeout_ms=3000)
+        daq  = ModuleClient("daq",  rep_port=daq_port,  pub_port=daq_port + 1,
+                            host=daq_host,  timeout_ms=8000)
+
+        try:
+            if not ctrl.ping():
+                self.log.emit(f"ERROR: CTRL server not reachable at {ctrl_host}:{ctrl_port}")
+                self.finished.emit(False)
+                return
+            if not daq.ping():
+                self.log.emit(f"ERROR: DAQ server not reachable at {daq_host}:{daq_port}")
+                self.finished.emit(False)
+                return
+
+            for step_i, gain in enumerate(gains):
+                if self._stop:
+                    self.log.emit("Sweep stopped by user")
+                    self.finished.emit(False)
+                    return
+
+                self.progress.emit(step_i, n_total)
+                gain_str = f"{gain:.4g}"
+                ch_str   = "+".join(f"ch{c}" for c in channels)
+                self.log.emit(f"Step {step_i + 1}/{n_total}: {ch_str} gain = {gain_str}")
+
+                # Set gain on all selected channels
+                for name in ch_names:
+                    try:
+                        ctrl.send("write_register", name=name, value=gain)
+                    except Exception as exc:
+                        self.log.emit(f"WARNING: write_register {name!r} failed: {exc}")
+
+                # Settle
+                if settle_s > 0:
+                    self.log.emit(f"  Settling {settle_s:.1f} s …")
+                    t0 = time.time()
+                    while time.time() - t0 < settle_s:
+                        if self._stop:
+                            self.finished.emit(False)
+                            return
+                        time.sleep(0.1)
+
+                # Basename encodes gain and channels
+                basename = f"{prefix}_{ch_str}_g{gain_str}"
+
+                # Start recording
+                try:
+                    resp = daq.send(
+                        "start_recording",
+                        n_files=files_per,
+                        basename=basename,
+                        output_dir=output_dir,
+                        sample_rate=sample_rate,
+                        n_bits=n_bits,
+                    )
+                except Exception as exc:
+                    self.log.emit(f"WARNING: start_recording failed: {exc}")
+                    continue
+
+                if resp.get("status") != "ok":
+                    self.log.emit(f"WARNING: start_recording error: {resp.get('message','')}")
+                    continue
+
+                self.log.emit(f"  Recording {files_per} file(s) → {basename}")
+
+                # Poll until done
+                deadline = time.time() + 3600
+                while time.time() < deadline:
+                    if self._stop:
+                        try:
+                            daq.send("stop_recording")
+                        except Exception:
+                            pass
+                        self.finished.emit(False)
+                        return
+                    time.sleep(0.5)
+                    try:
+                        st = daq.send("get_status")
+                    except Exception:
+                        continue
+                    if st.get("status") != "ok":
+                        continue
+                    data = st.get("data", {})
+                    if not data.get("recording", False):
+                        n_written = data.get("file_index", 0)
+                        if n_written == 0:
+                            self.log.emit(
+                                "  WARNING: 0 files written — check DAQ server logs")
+                        else:
+                            self.log.emit(f"  Done — {n_written} file(s) written")
+                        break
+
+            self.progress.emit(n_total, n_total)
+            self.log.emit("Gain sweep complete.")
+            self.finished.emit(True)
+
+        except Exception as exc:
+            self.log.emit(f"ERROR: {exc}")
+            self.finished.emit(False)
+        finally:
+            ctrl.close()
+            daq.close()
+
+
+# ---------------------------------------------------------------------------
 # Main window
 # ---------------------------------------------------------------------------
 
@@ -1097,6 +1262,7 @@ class FPGAWidget(QWidget):
         player_layout.setContentsMargins(8, 8, 8, 8)
         player_layout.setSpacing(4)
         player_layout.addWidget(self._build_waveform_player())
+        player_layout.addWidget(self._build_gain_sweep())
         player_scroll.setWidget(player_container)
         splitter.addWidget(player_scroll)
 
@@ -1559,6 +1725,402 @@ class FPGAWidget(QWidget):
 
         self._player_data: list = [None, None, None]
         return grp
+
+    # ------------------------------------------------------------------
+    # Gain sweep UI
+    # ------------------------------------------------------------------
+
+    def _build_gain_sweep(self) -> QGroupBox:
+        """Amplitude (ARB gain) sweep with DAQ recording and sweep-chain."""
+        grp = QGroupBox("Gain Sweep")
+        root = QVBoxLayout(grp)
+        root.setSpacing(5)
+
+        # -- Channels --
+        ch_row = QHBoxLayout()
+        ch_row.addWidget(QLabel("Channels:"))
+        self._gs_ch_checks: list[QCheckBox] = []
+        for i in range(3):
+            cb = QCheckBox(f"ch{i}")
+            cb.setChecked(i == 0)
+            self._gs_ch_checks.append(cb)
+            ch_row.addWidget(cb)
+        ch_row.addStretch()
+        root.addLayout(ch_row)
+
+        # -- Gain list --
+        gl_row = QHBoxLayout()
+        gl_row.addWidget(QLabel("Gain values:"))
+        self._gs_gain_list = QLineEdit()
+        self._gs_gain_list.setPlaceholderText("e.g.  0.5, 1.0, 2.0, 5.0")
+        gl_row.addWidget(self._gs_gain_list)
+        root.addLayout(gl_row)
+
+        # -- arange helper --
+        rng_row = QHBoxLayout()
+        rng_row.addWidget(QLabel("Range:"))
+        for attr, label, defval in [
+            ("_gs_start", "start ", 0.5),
+            ("_gs_stop",  "stop ",  5.0),
+            ("_gs_step",  "step ",  0.5),
+        ]:
+            sp = QDoubleSpinBox()
+            sp.setRange(0.0, 1000.0)
+            sp.setDecimals(4)
+            sp.setValue(defval)
+            sp.setMinimumWidth(95)
+            sp.setPrefix(label)
+            setattr(self, attr, sp)
+            rng_row.addWidget(sp)
+        rng_btn = QPushButton("→ List")
+        rng_btn.setMaximumWidth(60)
+        rng_btn.clicked.connect(self._gs_range_to_list)
+        rng_row.addWidget(rng_btn)
+        rng_row.addStretch()
+        root.addLayout(rng_row)
+
+        # -- Recording settings --
+        rec_box = QGroupBox("Recording Settings")
+        rl = QVBoxLayout(rec_box)
+
+        rr1 = QHBoxLayout()
+        rr1.addWidget(QLabel("Output dir:"))
+        self._gs_dir = QLineEdit()
+        self._gs_dir.setPlaceholderText("required")
+        rr1.addWidget(self._gs_dir)
+        dir_btn = QPushButton("Browse…")
+        dir_btn.setMaximumWidth(75)
+        dir_btn.clicked.connect(self._gs_browse_dir)
+        rr1.addWidget(dir_btn)
+        rl.addLayout(rr1)
+
+        rr2 = QHBoxLayout()
+        rr2.addWidget(QLabel("Prefix:"))
+        self._gs_prefix = QLineEdit("fpga_gain")
+        self._gs_prefix.setMaximumWidth(120)
+        rr2.addWidget(self._gs_prefix)
+        rr2.addWidget(QLabel("Files/step:"))
+        self._gs_files = QSpinBox()
+        self._gs_files.setRange(1, 200)
+        self._gs_files.setValue(1)
+        self._gs_files.setMaximumWidth(60)
+        rr2.addWidget(self._gs_files)
+        rr2.addWidget(QLabel("Settle (s):"))
+        self._gs_settle = QDoubleSpinBox()
+        self._gs_settle.setRange(0.0, 300.0)
+        self._gs_settle.setDecimals(1)
+        self._gs_settle.setValue(2.0)
+        self._gs_settle.setMaximumWidth(70)
+        rr2.addWidget(self._gs_settle)
+        rr2.addStretch()
+        rl.addLayout(rr2)
+
+        rr3 = QHBoxLayout()
+        rr3.addWidget(QLabel("Sample rate:"))
+        self._gs_rate = QDoubleSpinBox()
+        self._gs_rate.setRange(1.0, 2e6)
+        self._gs_rate.setDecimals(0)
+        self._gs_rate.setValue(10000.0)
+        self._gs_rate.setSuffix(" Hz")
+        self._gs_rate.setMinimumWidth(110)
+        rr3.addWidget(self._gs_rate)
+        rr3.addWidget(QLabel("n_bits:"))
+        self._gs_nbits = QSpinBox()
+        self._gs_nbits.setRange(10, 25)
+        self._gs_nbits.setValue(17)
+        self._gs_nbits.setMaximumWidth(55)
+        rr3.addWidget(self._gs_nbits)
+        rr3.addSpacing(16)
+        rr3.addWidget(QLabel("CTRL port:"))
+        self._gs_ctrl_port = QSpinBox()
+        self._gs_ctrl_port.setRange(1024, 65535)
+        self._gs_ctrl_port.setValue(5550)
+        self._gs_ctrl_port.setMaximumWidth(70)
+        rr3.addWidget(self._gs_ctrl_port)
+        rr3.addWidget(QLabel("DAQ port:"))
+        self._gs_daq_port = QSpinBox()
+        self._gs_daq_port.setRange(1024, 65535)
+        self._gs_daq_port.setValue(5552)
+        self._gs_daq_port.setMaximumWidth(70)
+        rr3.addWidget(self._gs_daq_port)
+        rr3.addStretch()
+        rl.addLayout(rr3)
+
+        root.addWidget(rec_box)
+
+        # -- Run buttons + progress --
+        run_row = QHBoxLayout()
+        self._gs_run_btn = QPushButton("Run Sweep")
+        self._gs_run_btn.setStyleSheet(
+            "QPushButton{background:#059669;color:white;font-weight:bold;}"
+            "QPushButton:disabled{background:#6ee7b7;}")
+        self._gs_run_btn.clicked.connect(self._gs_run_single)
+        run_row.addWidget(self._gs_run_btn)
+        self._gs_stop_btn = QPushButton("Stop")
+        self._gs_stop_btn.setEnabled(False)
+        self._gs_stop_btn.clicked.connect(self._gs_stop)
+        run_row.addWidget(self._gs_stop_btn)
+        self._gs_progress = QProgressBar()
+        self._gs_progress.setTextVisible(True)
+        self._gs_progress.setValue(0)
+        run_row.addWidget(self._gs_progress, 1)
+        root.addLayout(run_row)
+
+        self._gs_status = QLabel("—")
+        self._gs_status.setStyleSheet("color:gray;")
+        root.addWidget(self._gs_status)
+
+        # -- Sweep chain --
+        chain_box = QGroupBox("Sweep Chain")
+        cl = QVBoxLayout(chain_box)
+
+        chain_btn_row = QHBoxLayout()
+        add_btn = QPushButton("Add to List")
+        add_btn.clicked.connect(self._gs_add_to_list)
+        chain_btn_row.addWidget(add_btn)
+        rm_btn = QPushButton("Remove Last")
+        rm_btn.clicked.connect(self._gs_remove_last)
+        chain_btn_row.addWidget(rm_btn)
+        clr_btn = QPushButton("Clear")
+        clr_btn.clicked.connect(self._gs_clear_list)
+        chain_btn_row.addWidget(clr_btn)
+        save_btn = QPushButton("Save Recipe")
+        save_btn.clicked.connect(self._gs_save_recipe)
+        chain_btn_row.addWidget(save_btn)
+        load_btn = QPushButton("Load Recipe")
+        load_btn.clicked.connect(self._gs_load_recipe)
+        chain_btn_row.addWidget(load_btn)
+        chain_btn_row.addStretch()
+        cl.addLayout(chain_btn_row)
+
+        self._gs_list_lbl = QLabel("(empty)")
+        self._gs_list_lbl.setStyleSheet("color:gray;font-size:11px;")
+        self._gs_list_lbl.setWordWrap(True)
+        cl.addWidget(self._gs_list_lbl)
+
+        run_list_row = QHBoxLayout()
+        self._gs_run_list_btn = QPushButton("Run List")
+        self._gs_run_list_btn.setStyleSheet(
+            "QPushButton{background:#1d4ed8;color:white;font-weight:bold;}"
+            "QPushButton:disabled{background:#93c5fd;}")
+        self._gs_run_list_btn.clicked.connect(self._gs_run_list)
+        run_list_row.addWidget(self._gs_run_list_btn)
+        run_list_row.addStretch()
+        cl.addLayout(run_list_row)
+
+        root.addWidget(chain_box)
+
+        # Internal state
+        self._gs_worker: "_GainSweepWorker | None" = None
+        self._gs_sweep_list: list[dict] = []
+        self._gs_pending_list: list[dict] = []
+        self._gs_running_list: bool = False
+
+        return grp
+
+    # -- Gain sweep helpers --
+
+    def _gs_range_to_list(self):
+        start = self._gs_start.value()
+        stop  = self._gs_stop.value()
+        step  = self._gs_step.value()
+        if step <= 0 or start >= stop:
+            self._gs_status.setText("Invalid range (need start < stop, step > 0)")
+            self._gs_status.setStyleSheet("color:red;")
+            return
+        gains = np.arange(start, stop, step)
+        if len(gains) == 0:
+            self._gs_status.setText("Range produced no values")
+            self._gs_status.setStyleSheet("color:red;")
+            return
+        self._gs_gain_list.setText(", ".join(f"{g:.6g}" for g in gains))
+        self._gs_status.setText(f"{len(gains)} gain steps loaded")
+        self._gs_status.setStyleSheet("color:gray;")
+
+    def _gs_browse_dir(self):
+        d = QFileDialog.getExistingDirectory(self, "Select Output Directory")
+        if d:
+            self._gs_dir.setText(d)
+
+    def _gs_build_cfg(self) -> dict | None:
+        """Collect current UI settings into a cfg dict, or return None on error."""
+        raw = self._gs_gain_list.text().strip()
+        if not raw:
+            self._gs_status.setText("Enter gain values first")
+            self._gs_status.setStyleSheet("color:red;")
+            return None
+        try:
+            gains = [float(x.strip()) for x in raw.split(",") if x.strip()]
+        except ValueError:
+            self._gs_status.setText("Invalid gain list")
+            self._gs_status.setStyleSheet("color:red;")
+            return None
+        if not gains:
+            self._gs_status.setText("No valid gain values")
+            self._gs_status.setStyleSheet("color:red;")
+            return None
+
+        output_dir = self._gs_dir.text().strip()
+        if not output_dir:
+            self._gs_status.setText("Output directory required")
+            self._gs_status.setStyleSheet("color:red;")
+            return None
+
+        channels = [i for i, cb in enumerate(self._gs_ch_checks) if cb.isChecked()]
+        if not channels:
+            self._gs_status.setText("Select at least one channel")
+            self._gs_status.setStyleSheet("color:red;")
+            return None
+
+        return {
+            "gains":         gains,
+            "channels":      channels,
+            "settle_s":      self._gs_settle.value(),
+            "files_per_step": self._gs_files.value(),
+            "output_dir":    output_dir,
+            "prefix":        self._gs_prefix.text().strip() or "fpga_gain",
+            "sample_rate":   self._gs_rate.value(),
+            "n_bits":        self._gs_nbits.value(),
+            "ctrl_host":     "localhost",
+            "ctrl_port":     self._gs_ctrl_port.value(),
+            "daq_host":      "localhost",
+            "daq_port":      self._gs_daq_port.value(),
+        }
+
+    def _gs_launch_worker(self, cfg: dict):
+        self._gs_run_btn.setEnabled(False)
+        self._gs_run_list_btn.setEnabled(False)
+        self._gs_stop_btn.setEnabled(True)
+        self._gs_progress.setValue(0)
+        self._gs_progress.setMaximum(len(cfg["gains"]))
+
+        self._gs_worker = _GainSweepWorker(cfg, parent=self)
+        self._gs_worker.log.connect(self._gs_on_log)
+        self._gs_worker.progress.connect(
+            lambda cur, tot: self._gs_progress.setValue(cur))
+        self._gs_worker.finished.connect(self._gs_on_finished)
+        self._gs_worker.start()
+
+    def _gs_run_single(self):
+        if self._gs_worker is not None:
+            return
+        cfg = self._gs_build_cfg()
+        if cfg is None:
+            return
+        self._gs_running_list = False
+        self._gs_launch_worker(cfg)
+
+    def _gs_stop(self):
+        if self._gs_worker is not None:
+            self._gs_worker.stop()
+
+    def _gs_on_log(self, msg: str):
+        self._gs_status.setText(msg)
+        self._gs_status.setStyleSheet("color:gray;")
+        self._append_status(f"[GainSweep] {msg}")
+
+    def _gs_on_finished(self, ok: bool):
+        self._gs_worker = None
+        self._gs_stop_btn.setEnabled(False)
+        color = "color:green;" if ok else "color:red;"
+        self._gs_status.setStyleSheet(color)
+        if self._gs_running_list:
+            self._gs_run_next_in_list()
+        else:
+            self._gs_run_btn.setEnabled(True)
+            self._gs_run_list_btn.setEnabled(True)
+
+    # -- Sweep chain --
+
+    def _gs_format_entry(self, cfg: dict) -> str:
+        channels = "+".join(f"ch{c}" for c in cfg["channels"])
+        gains    = cfg["gains"]
+        return (f"{channels}  gains: {gains[0]:.4g}…{gains[-1]:.4g} "
+                f"({len(gains)} steps)  {cfg['files_per_step']} file(s)/step")
+
+    def _gs_refresh_list_display(self):
+        if not self._gs_sweep_list:
+            self._gs_list_lbl.setText("(empty)")
+            self._gs_list_lbl.setStyleSheet("color:gray;font-size:11px;")
+        else:
+            lines = [f"  {i+1}. {self._gs_format_entry(c)}"
+                     for i, c in enumerate(self._gs_sweep_list)]
+            self._gs_list_lbl.setText("\n".join(lines))
+            self._gs_list_lbl.setStyleSheet("color:black;font-size:11px;")
+
+    def _gs_add_to_list(self):
+        cfg = self._gs_build_cfg()
+        if cfg is None:
+            return
+        self._gs_sweep_list.append(cfg)
+        self._gs_refresh_list_display()
+
+    def _gs_remove_last(self):
+        if self._gs_sweep_list:
+            self._gs_sweep_list.pop()
+            self._gs_refresh_list_display()
+
+    def _gs_clear_list(self):
+        self._gs_sweep_list.clear()
+        self._gs_refresh_list_display()
+
+    def _gs_save_recipe(self):
+        path, _ = QFileDialog.getSaveFileName(
+            self, "Save Gain Sweep Recipe", "", "JSON files (*.json)")
+        if not path:
+            return
+        try:
+            with open(path, "w") as f:
+                json.dump(self._gs_sweep_list, f, indent=2)
+            self._gs_status.setText(f"Recipe saved: {path}")
+            self._gs_status.setStyleSheet("color:green;")
+        except Exception as exc:
+            self._gs_status.setText(f"Save error: {exc}")
+            self._gs_status.setStyleSheet("color:red;")
+
+    def _gs_load_recipe(self):
+        path, _ = QFileDialog.getOpenFileName(
+            self, "Load Gain Sweep Recipe", "", "JSON files (*.json)")
+        if not path:
+            return
+        try:
+            with open(path) as f:
+                data = json.load(f)
+            if not isinstance(data, list):
+                raise ValueError("Recipe must be a JSON list")
+            self._gs_sweep_list = data
+            self._gs_refresh_list_display()
+            self._gs_status.setText(f"Recipe loaded: {len(data)} sweep(s)")
+            self._gs_status.setStyleSheet("color:green;")
+        except Exception as exc:
+            self._gs_status.setText(f"Load error: {exc}")
+            self._gs_status.setStyleSheet("color:red;")
+
+    def _gs_run_list(self):
+        if self._gs_worker is not None or not self._gs_sweep_list:
+            return
+        self._gs_pending_list = list(self._gs_sweep_list)
+        self._gs_running_list = True
+        self._gs_run_next_in_list()
+
+    def _gs_run_next_in_list(self):
+        if not self._gs_pending_list or self._gs_worker is not None:
+            self._gs_on_list_done()
+            return
+        cfg = self._gs_pending_list.pop(0)
+        remaining = len(self._gs_pending_list)
+        self._gs_on_log(
+            f"List: starting sweep ({remaining} remaining after this)")
+        self._gs_launch_worker(cfg)
+
+    def _gs_on_list_done(self):
+        self._gs_running_list = False
+        self._gs_worker = None
+        self._gs_run_btn.setEnabled(True)
+        self._gs_run_list_btn.setEnabled(True)
+        self._gs_stop_btn.setEnabled(False)
+        self._gs_status.setText("Sweep list complete.")
+        self._gs_status.setStyleSheet("color:green;")
 
     # ------------------------------------------------------------------
     # (Trapping tab moved to procedures/proc_trapping.py — see _build_ui)
