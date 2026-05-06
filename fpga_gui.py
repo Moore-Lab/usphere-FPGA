@@ -2637,7 +2637,8 @@ class FPGAWidget(QWidget):
         errors = self._ctrl.write_many(to_write)
         if errors:
             self._append_status(f"Set filter ({axis}) errors: {errors}")
-        self._on_read_all()
+        else:
+            self._append_status(f"Set {', '.join(coeff_keys)}")
 
     def _on_change_pars(self, axis: str) -> None:
         if not self._ctrl.is_connected:
